@@ -7,6 +7,7 @@ from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = torch.hpu.is_available() # TODO torch.version.hpu is not supported
 
 
 class CustomOp(nn.Module):
@@ -40,6 +41,8 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_hpu:
+            return self.forward_hpu
         else:
             return self.forward_native
 

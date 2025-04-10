@@ -1312,8 +1312,8 @@ def get_device_capability(device_id: int = 0) -> Tuple[int, int]:
         try:
             # TODO(HandH1998): `get_device_capability` is not supported by `torch.hpu` for now.
             # Update this once the support is available.
-            # major, minor = torch.hpu.get_device_capability(device_id)
-            major, minor = None, None
+            major, minor = torch.hpu.get_device_capability(device_id)
+            # major, minor = None, None
         except Exception as e:
             raise RuntimeError(
                 f"An error occurred while getting device capability of hpu: {e}."
