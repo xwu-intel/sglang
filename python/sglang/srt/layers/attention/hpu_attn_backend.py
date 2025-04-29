@@ -69,7 +69,7 @@ class HPUAttnBackend(AttentionBackend):
         value = v.view(1, -1, layer.tp_v_head_num, layer.v_head_dim)
 
         output = ops.prompt_attention(
-            impl="fsdpa",
+            impl="naive",
             query=query,
             key=key,
             value=value,

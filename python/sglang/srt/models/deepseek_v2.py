@@ -88,10 +88,12 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
@@ -122,6 +124,8 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
+
+    HPU_ATTN = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -504,13 +508,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
@@ -600,6 +605,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return AttnForwardMethod.MLA
         else:
+            if _is_hpu:
+                return AttnForwardMethod.HPU_ATTN
+
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
                 forward_batch.forward_mode.is_extend()
@@ -1455,6 +1463,15 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
+
+        if _is_hpu:
+            self.n_share_experts_fusion = 0
+            global_server_args_dict["n_share_experts_fusion"] = 0
+            logger.info(
+                "Shared experts fusion optimization is disabled for HPU."
+            )
+            return
+
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.

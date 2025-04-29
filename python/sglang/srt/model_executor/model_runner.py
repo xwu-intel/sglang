@@ -143,7 +143,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA if not _is_hpu else False
         self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
