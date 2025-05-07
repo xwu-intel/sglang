@@ -1131,6 +1131,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 req_pool_indices_tensor,
                 prefix_lens_tensor,
             )
+            print("last_loc", last_loc)
+
             out_cache_loc = self.alloc_paged_token_slots_extend(
                 prefix_lens_tensor, seq_lens_tensor, last_loc, extend_num_tokens
             )

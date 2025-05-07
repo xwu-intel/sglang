@@ -803,6 +803,8 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+            # TODO: Workaround to materilize the req_to_token_pool before KV cache are allocated on HPU, otherwise will OOM.
+            self.req_to_token_pool.req_to_token.to("cpu")
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
