@@ -97,6 +97,7 @@ class RMSNorm(CustomOp):
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         if residual is not None:
+            print(x.shape, residual.shape)
             x = x + residual.to(torch.float32)
             residual = x.to(orig_dtype)
 

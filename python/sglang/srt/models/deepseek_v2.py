@@ -205,6 +205,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -311,8 +312,12 @@ class DeepseekV2MoE(nn.Module):
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output = self._forward_shared_experts(hidden_states)
+
+        shared_output = None
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
@@ -526,6 +531,8 @@ class DeepseekV2AttentionMLA(nn.Module):
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
 
+        import rpdb; rpdb.set_trace()
+
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
             self.kv_lora_rank + self.qk_rope_head_dim,
@@ -606,7 +613,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 return AttnForwardMethod.MLA
         else:
             if _is_hpu:
-                return AttnForwardMethod.HPU_ATTN
+                return AttnForwardMethod.MHA
 
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
@@ -695,9 +702,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        # forward_batch.token_to_kv_pool.set_kv_buffer(
+        #     self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        # )
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -1225,7 +1232,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:

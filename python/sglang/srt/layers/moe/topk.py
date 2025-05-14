@@ -20,10 +20,11 @@ import torch.nn.functional as F
 
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, is_hpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -89,7 +90,7 @@ def fused_topk(
 
 
 # This is used by the Deepseek V2/V3/R1 series models
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def grouped_topk(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

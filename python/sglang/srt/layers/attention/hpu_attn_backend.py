@@ -64,9 +64,14 @@ class HPUAttnBackend(AttentionBackend):
                 layer, forward_batch.out_cache_loc, k, v
             )
 
+        # print("****", q.shape, k.shape, v.shape)
+
         query = q.view(1, -1, layer.tp_q_head_num, layer.qk_head_dim)
         key = k.view(1, -1, layer.tp_k_head_num, layer.qk_head_dim)
         value = v.view(1, -1, layer.tp_v_head_num, layer.v_head_dim)
+
+        # print("****", query.shape, key.shape, value.shape)
+
 
         output = ops.prompt_attention(
             impl="naive",
@@ -82,7 +87,10 @@ class HPUAttnBackend(AttentionBackend):
             matmul_av_op=self.matmul_av,
             fsdpa_op=self.fused_scaled_dot_product_attention,
         )
-        output = output.reshape(q.shape)
+
+        # print("****", output.shape)
+        # output = output.reshape(q.shape)
+        output = output.reshape(q.shape[0], q.shape[1], v.shape[2])
 
         return output
 

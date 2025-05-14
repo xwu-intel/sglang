@@ -99,6 +99,7 @@ def moe_forward_native(
     idxs = topk_ids.view(-1).argsort()
 
     sorted_tokens = x[idxs // topk_ids.shape[1]]
+
     tokens_per_expert = tokens_per_expert.cpu().numpy()
 
     if activation == "silu":
