@@ -129,6 +129,9 @@ def moe_forward_native(
     outs = torch.cat(outputs, dim=0) if len(outputs) else sorted_tokens.new_empty(0)
     new_x = torch.empty_like(outs)
 
+    # TODO: Error in Lazy mode when print new_x[idxs]
+    #     ipdb> new_x[idxs]
+    # *** RuntimeError: The expanded size of the tensor (6144) must match the existing size (30720) at non-singleton dimension 0.  Target sizes: [6144, 2048].  Tensor sizes: [30720, 2048]
     new_x[idxs] = outs
     final_out = (
         new_x.view(*topk_ids.shape, -1)
