@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import time
 import logging
 import os
 from dataclasses import dataclass
@@ -1958,6 +1959,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                             param_name = name.replace(
                                 "q_a_proj", "fused_qkv_a_proj_with_mqa"
                             )
+
+                            # if get_tensor_model_parallel_rank() == 0:
+                            #     import rpdb; rpdb.set_trace()
+                            # else:
+                            #     time.sleep(100000)
+
                             param = params_dict[param_name]
 
                             weight_loader = getattr(
