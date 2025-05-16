@@ -89,8 +89,8 @@ class HPUAttnBackend(AttentionBackend):
         )
 
         # print("****", output.shape)
-        # output = output.reshape(q.shape)
-        output = output.reshape(q.shape[0], q.shape[1], v.shape[2])
+        output = output.reshape(q.shape)
+        # output = output.reshape(q.shape[0], q.shape[1], v.shape[2])
 
         return output
 
