@@ -223,7 +223,9 @@ class ServerArgs:
 
         # Set mem fraction static, which depends on the tensor parallelism size
         if self.mem_fraction_static is None:
-            if gpu_mem <= 81920:
+            if gpu_mem is None: # for CPU
+                self.mem_fraction_static = 0.88
+            elif gpu_mem <= 81920:
                 if self.tp_size >= 16:
                     self.mem_fraction_static = 0.79
                 elif self.tp_size >= 8:
