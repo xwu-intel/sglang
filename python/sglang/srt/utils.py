@@ -313,6 +313,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
         free_gpu_memory = total_gpu_memory - used_memory
 
     elif device == "hpu":
+        """
         num_gpus = torch.hpu.device_count()
         assert gpu_id < num_gpus
 
@@ -321,7 +322,7 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
                 f"WARNING: current device is not {gpu_id}, but {torch.hpu.current_device()}, ",
                 "which may cause useless memory allocation for torch HPU context.",
             )
-
+        """
         free_gpu_memory, total_gpu_memory = torch.hpu.mem_get_info()
 
     elif device == "cpu":
@@ -329,9 +330,17 @@ def get_available_gpu_memory(device, gpu_id, distributed=False, empty_cache=True
         free_gpu_memory = psutil.virtual_memory().available
 
     if distributed:
-        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(
-            torch.device(device, gpu_id)
-        )
+        if device == "hpu":
+            tensor_device = torch.device("hpu")
+        else:
+            tensor_device = torch.device(device, gpu_id)
+        # inited = torch.distributed.is_initialized()
+        tensor = torch.tensor(free_gpu_memory, dtype=torch.float32, device=tensor_device)
+        # tensor_shape = tensor.shape
+        # tensor_dim = tensor.dim()
+        # print(f">>>>>>>>>>>>>>>>>>>>>>>> free_gpu_memory = {free_gpu_memory}, tensor_device = {tensor_device}, is_hpu = {is_hpu()}, torch.distributed.is_initialized = {inited}, tensor_shape = {tensor_shape}, tensor_dim = {tensor_dim}")
+        # print(f">>>>>>>>>>>>>>>>>>>>>>>> tensor = {tensor}")
+        # assert tensor.dim() == 0, "Tensor must be a scalar!"
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
 
