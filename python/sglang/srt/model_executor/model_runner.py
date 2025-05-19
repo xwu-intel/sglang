@@ -57,9 +57,13 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
     TokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.paged_allocator import PagedTokenToKVPoolAllocator
+from sglang.srt.mem_cache.paged_allocator import (
+    HeapPagedTokenToKVPoolAllocator,
+    PagedTokenToKVPoolAllocator,
+)
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.hpu_graph_runner import HPUGraphRunner
 from sglang.srt.model_loader import get_model
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
@@ -84,12 +88,16 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_hip,
     is_hopper_with_cuda_12_3,
+    is_hpu,
     is_no_spec_infer_or_topk_one,
     monkey_patch_p2p_access_check,
     monkey_patch_vllm_gguf_config,
     set_cpu_offload_max_bytes,
     set_cuda_arch,
 )
+
+_is_hpu = is_hpu()
+logger = logging.getLogger(__name__)
 
 # Use a small KV cache pool size for tests in CI
 SGLANG_CI_SMALL_KV_SIZE = os.getenv("SGLANG_CI_SMALL_KV_SIZE", None)
@@ -135,7 +143,7 @@ class ModelRunner:
         self.page_size = server_args.page_size
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA
+        self.use_mla_backend = self.model_config.attention_arch == AttentionArch.MLA if not _is_hpu else False
         self.attention_chunk_size = model_config.attention_chunk_size
 
         # Model-specific adjustment
@@ -220,6 +228,9 @@ class ModelRunner:
             self.init_cublas()
             self.init_attention_backend()
             self.init_cuda_graphs()
+        elif self.device == "hpu":
+            self.init_attention_backend()
+            self.cuda_graph_runner = HPUGraphRunner(self)
         else:
             self.cuda_graph_runner = None
             self.init_attention_backend()
@@ -272,6 +283,7 @@ class ModelRunner:
                     "triton",
                     "flashmla",
                     "cutlass_mla",
+                    "hpu_attn_backend"
                 ]:
                     logger.info(
                         f"MLA optimization is turned on. Use {server_args.attention_backend} backend."
@@ -798,6 +810,8 @@ class ModelRunner:
                 device=self.device,
                 enable_memory_saver=self.server_args.enable_memory_saver,
             )
+            # TODO: Workaround to materilize the req_to_token_pool before KV cache are allocated on HPU, otherwise will OOM.
+            self.req_to_token_pool.req_to_token.to("cpu")
         else:
             # Draft worker shares req_to_token_pool with the target worker.
             assert self.is_draft_worker
@@ -846,13 +860,22 @@ class ModelRunner:
                     kvcache=self.token_to_kv_pool,
                 )
             else:
-                self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
-                    self.max_total_num_tokens,
-                    page_size=self.page_size,
-                    dtype=self.kv_cache_dtype,
-                    device=self.device,
-                    kvcache=self.token_to_kv_pool,
-                )
+                if _is_hpu:
+                    self.token_to_kv_pool_allocator = HeapPagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
+                else:
+                    self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+                        self.max_total_num_tokens,
+                        page_size=self.page_size,
+                        dtype=self.kv_cache_dtype,
+                        device=self.device,
+                        kvcache=self.token_to_kv_pool,
+                    )
         else:
             assert self.is_draft_worker
 
@@ -913,6 +936,10 @@ class ModelRunner:
             )
 
             self.attn_backend = TorchNativeAttnBackend(self)
+        elif self.server_args.attention_backend == "hpu_attn_backend":
+            from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
+
+            self.attn_backend = HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
