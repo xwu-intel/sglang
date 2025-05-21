@@ -64,12 +64,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     print_warning_once,
     set_weight_attrs,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_hip:
     from aiter import ActivationType
@@ -305,6 +307,31 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if _is_hpu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import pad_block_fp8_weight_naive
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                    dynamic_quant,
+                    dequant_block_fp8_weight_naive,
+                    apply_block_fp8_linear_hpu_dynamic,
+                    apply_block_fp8_linear_hpu_dequant)
+                weight, orig_M, orig_N = pad_block_fp8_weight_naive(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size)
+
+                weight, weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+                        weight,
+                        layer.weight_scale_inv.data,
+                        self.quant_config.weight_block_size,
+                        original_M=orig_M,
+                        original_N=orig_N,
+                        do_unpad=True))
+                weight_scale_inv = weight_scale_inv.squeeze(-1)
+                layer.weight.data.copy_(weight)
+                layer.weight_scale_inv = Parameter(weight_scale_inv,
+                                                requires_grad=False)
+                return
+
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_hip:
                 # activation_scheme: dynamic
@@ -415,13 +442,34 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            return apply_w8a8_block_fp8_linear(
-                input=x,
-                weight=layer.weight,
-                block_size=self.quant_config.weight_block_size,
-                weight_scale=layer.weight_scale_inv,
-                input_scale=None,
-                bias=bias,
+            # from sglang.srt.distributed import get_tensor_model_parallel_rank
+            # import time
+            # if get_tensor_model_parallel_rank()==0:
+            #     import rpdb; rpdb.set_trace()
+            # else:
+            #     time.sleep(1000000)
+
+            assert self.quant_config.weight_block_size is not None
+            if _is_hpu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+                    apply_block_fp8_linear_hpu_dynamic
+                )
+                output = apply_block_fp8_linear_hpu_dynamic(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                )
+                return output
+            else:
+                return apply_w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                    bias=bias,
             )
 
         return apply_fp8_linear(

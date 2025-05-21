@@ -16,6 +16,7 @@
 # https://github.com/vllm-project/vllm/blob/fb6af8bc086328ca6659e72d11ffd4309ce4de22/vllm/model_executor/models/deepseek_v2.py
 """Inference-only DeepseekV2 model."""
 
+import time
 import logging
 import os
 from dataclasses import dataclass
@@ -76,10 +77,11 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.layers.utils import is_pp_missing_parameter
 from sglang.srt.managers.expert_distribution import ExpertDistributionRecorder
 from sglang.srt.managers.schedule_batch import global_server_args_dict
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
 from sglang.srt.utils import (
     BumpAllocator,
     DeepEPMode,
@@ -88,10 +90,12 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_cuda:
     from sgl_kernel import awq_dequantize, bmm_fp8, merge_state_v2
@@ -122,6 +126,8 @@ class AttnForwardMethod(IntEnum):
     # Use multi-head attention, but with KV cache chunked.
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
+
+    HPU_ATTN = auto()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -201,6 +207,7 @@ class DeepseekV2MoE(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
+
         self.tp_size = get_tensor_model_parallel_world_size()
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
@@ -307,8 +314,10 @@ class DeepseekV2MoE(nn.Module):
 
     def forward_normal(self, hidden_states: torch.Tensor) -> torch.Tensor:
         shared_output = self._forward_shared_experts(hidden_states)
+
         # router_logits: (num_tokens, n_experts)
         router_logits = self.gate(hidden_states)
+
         final_hidden_states = (
             self.experts(hidden_states=hidden_states, router_logits=router_logits)
             * self.routed_scaling_factor
@@ -401,6 +410,167 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
         return 1.0
     return 0.1 * mscale * math.log(scale) + 1.0
 
+class DeepseekV2Attention(nn.Module):
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        hidden_size: int,
+        num_heads: int,
+        qk_nope_head_dim: int,
+        qk_rope_head_dim: int,
+        v_head_dim: int,
+        q_lora_rank: int,
+        kv_lora_rank: int,
+        rope_theta: float = 10000,
+        rope_scaling: Optional[Dict[str, Any]] = None,
+        max_position_embeddings: int = 8192,
+        quant_config: Optional[QuantizationConfig] = None,
+        layer_id=None,
+    ) -> None:
+        super().__init__()
+        self.layer_id = layer_id
+        self.hidden_size = hidden_size
+        self.qk_nope_head_dim = qk_nope_head_dim
+        self.qk_rope_head_dim = qk_rope_head_dim
+        self.qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+        self.num_heads = num_heads
+        tp_size = get_tensor_model_parallel_world_size()
+        assert num_heads % tp_size == 0
+        self.num_local_heads = num_heads // tp_size
+        self.scaling = self.qk_head_dim**-0.5
+        self.rope_theta = rope_theta
+        self.max_position_embeddings = max_position_embeddings
+
+        if self.q_lora_rank is not None:
+            self.q_a_proj = ReplicatedLinear(
+                self.hidden_size,
+                self.q_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+            )
+            self.q_a_layernorm = RMSNorm(self.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_b_proj = ColumnParallelLinear(
+                q_lora_rank,
+                self.num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+        else:
+            self.q_proj = ColumnParallelLinear(
+                self.hidden_size,
+                self.num_heads * self.qk_head_dim,
+                bias=False,
+                quant_config=quant_config,
+            )
+
+        self.kv_a_proj_with_mqa = ReplicatedLinear(
+            self.hidden_size,
+            self.kv_lora_rank + self.qk_rope_head_dim,
+            bias=False,
+            quant_config=quant_config,
+        )
+        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_b_proj = ColumnParallelLinear(
+            self.kv_lora_rank,
+            self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
+            bias=False,
+            quant_config=quant_config,
+        )
+        # O projection.
+        self.o_proj = RowParallelLinear(
+            self.num_heads * self.v_head_dim,
+            self.hidden_size,
+            bias=False,
+            quant_config=quant_config,
+        )
+        rope_scaling["rope_type"] = "deepseek_yarn"
+        self.rotary_emb = get_rope_wrapper(
+            qk_rope_head_dim,
+            rotary_dim=qk_rope_head_dim,
+            max_position=max_position_embeddings,
+            base=rope_theta,
+            rope_scaling=rope_scaling,
+            is_neox_style=False,
+            device=global_server_args_dict["device"],
+        )
+
+        if rope_scaling:
+            mscale_all_dim = rope_scaling.get("mscale_all_dim", False)
+            scaling_factor = rope_scaling["factor"]
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            self.scaling = self.scaling * mscale * mscale
+
+        # TODO, support head_size 192
+        self.attn = RadixAttention(
+            self.num_local_heads,
+            # self.qk_head_dim,
+            256,
+            self.scaling,
+            num_kv_heads=self.num_local_heads,
+            layer_id=layer_id,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs
+    ) -> torch.Tensor:
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # import time
+        # if get_tensor_model_parallel_rank()==0:
+        #     import rpdb; rpdb.set_trace()
+        # else:
+        #     time.sleep(1000000)
+
+        print("***", self.q_lora_rank, hidden_states.shape)
+
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(hidden_states)[0]
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+        else:
+            q = self.q_proj(hidden_states)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
+        print("***", q.shape)
+        _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        print("*** input hidden state", hidden_states.shape)
+        latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        print("*** output latent", latent_cache.shape)
+        kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
+        latent_cache = latent_cache.unsqueeze(1)
+        kv_a = self.kv_a_layernorm(kv_a.contiguous())
+        kv = self.kv_b_proj(kv_a)[0]
+        kv = kv.view(-1, self.num_local_heads, self.qk_nope_head_dim + self.v_head_dim)
+        k_nope, v = kv.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        k_pe = latent_cache[:, :, self.kv_lora_rank :]
+        q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        q[..., self.qk_nope_head_dim :] = q_pe
+        k = torch.empty_like(q)
+        k[..., : self.qk_nope_head_dim] = k_nope
+        k[..., self.qk_nope_head_dim :] = k_pe
+        q = torch.nn.functional.pad(q, [0, 256 - self.qk_head_dim], value=0).view(
+            -1, self.num_local_heads * 256
+        )
+        k = torch.nn.functional.pad(k, [0, 256 - self.qk_head_dim], value=0).view(
+            -1, self.num_local_heads * 256
+        )
+        v = torch.nn.functional.pad(v, [0, 256 - self.v_head_dim], value=0).view(
+            -1, self.num_local_heads * 256
+        )
+        attn_output = self.attn(q, k, v, forward_batch)
+        attn_output = attn_output.view(-1, self.num_local_heads, 256)[
+            ..., : self.v_head_dim
+        ].reshape(-1, self.num_local_heads * self.v_head_dim)
+        output, _ = self.o_proj(attn_output)
+        return output
 
 class DeepseekV2AttentionMLA(nn.Module):
 
@@ -504,13 +674,14 @@ class DeepseekV2AttentionMLA(nn.Module):
         if rope_scaling:
             rope_scaling["rope_type"] = "deepseek_yarn"
 
-        self.rotary_emb = get_rope(
+        self.rotary_emb = get_rope_wrapper(
             qk_rope_head_dim,
             rotary_dim=qk_rope_head_dim,
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
             is_neox_style=False,
+            device=global_server_args_dict["device"],
         )
 
         if rope_scaling:
@@ -520,6 +691,8 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.scaling = self.scaling * mscale * mscale
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
+
+        # import rpdb; rpdb.set_trace()
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -600,6 +773,9 @@ class DeepseekV2AttentionMLA(nn.Module):
             else:
                 return AttnForwardMethod.MLA
         else:
+            if _is_hpu:
+                return AttnForwardMethod.MHA
+
             # Triton: Use normal computation for prefill and use weight absorption for extend/decode
             if (
                 forward_batch.forward_mode.is_extend()
@@ -687,9 +863,9 @@ class DeepseekV2AttentionMLA(nn.Module):
         latent_cache[:, :, self.kv_lora_rank :] = k_pe
 
         # Save latent cache
-        forward_batch.token_to_kv_pool.set_kv_buffer(
-            self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
-        )
+        # forward_batch.token_to_kv_pool.set_kv_buffer(
+        #     self.attn_mha, forward_batch.out_cache_loc, latent_cache, None
+        # )
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -1115,25 +1291,44 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.dp_size = get_attention_dp_size()
         self.attn_tp_size = get_attention_tp_size()
         self.attn_tp_rank = get_attention_tp_rank()
-        self.self_attn = DeepseekV2AttentionMLA(
-            config=config,
-            hidden_size=self.hidden_size,
-            num_heads=config.num_attention_heads,
-            qk_nope_head_dim=config.qk_nope_head_dim,
-            qk_rope_head_dim=config.qk_rope_head_dim,
-            v_head_dim=config.v_head_dim,
-            q_lora_rank=(
-                config.q_lora_rank if hasattr(config, "q_lora_rank") else None
-            ),
-            kv_lora_rank=config.kv_lora_rank,
-            rope_theta=rope_theta,
-            rope_scaling=rope_scaling,
-            max_position_embeddings=max_position_embeddings,
-            quant_config=quant_config,
-            layer_id=layer_id,
-            reduce_results=False,
-            prefix=add_prefix("self_attn", prefix),
-        )
+        if not is_hpu:
+            self.self_attn = DeepseekV2AttentionMLA(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=(
+                    config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+                ),
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                layer_id=layer_id,
+                reduce_results=False,
+                prefix=add_prefix("self_attn", prefix),
+            )
+        else:
+            self.self_attn = DeepseekV2Attention(
+                config=config,
+                hidden_size=self.hidden_size,
+                num_heads=config.num_attention_heads,
+                qk_nope_head_dim=config.qk_nope_head_dim,
+                qk_rope_head_dim=config.qk_rope_head_dim,
+                v_head_dim=config.v_head_dim,
+                q_lora_rank=(
+                    config.q_lora_rank if hasattr(config, "q_lora_rank") else None
+                ),
+                kv_lora_rank=config.kv_lora_rank,
+                rope_theta=rope_theta,
+                rope_scaling=rope_scaling,
+                max_position_embeddings=max_position_embeddings,
+                quant_config=quant_config,
+                layer_id=layer_id,
+            )
 
         self.info = self._compute_info(config, layer_id=layer_id, is_nextn=is_nextn)
         previous_layer_info = self._compute_info(
@@ -1217,7 +1412,6 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
-
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1416,6 +1610,7 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
+            print("layer_id", i, "layer", layer)
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
@@ -1455,6 +1650,15 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_n_share_experts_fusion(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
+
+        if _is_hpu:
+            self.n_share_experts_fusion = 0
+            global_server_args_dict["n_share_experts_fusion"] = 0
+            logger.info(
+                "Shared experts fusion optimization is disabled for HPU."
+            )
+            return
+
         self.n_share_experts_fusion = global_server_args_dict["n_share_experts_fusion"]
         if self.n_share_experts_fusion > 0:
             # Only Deepseek V3/R1 can use shared experts fusion optimization now.
@@ -1473,7 +1677,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 ), f"Shared experts fusion optimization is enabled in DeepSeek V3/R1, set it to {self.tp_size} can get best optimized performace."
         elif self.n_share_experts_fusion == 0:
             if (
-                torch.cuda.get_device_capability("cuda") >= (9, 0)
+                (is_hpu() or torch.cuda.get_device_capability("cuda") >= (9, 0))
                 and self.config.architectures[0] == architecture
                 and self.config.n_routed_experts == 256
                 and (not global_server_args_dict["enable_deepep_moe"])
@@ -1613,6 +1817,120 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        stacked_params_mapping = [
+            # (param_name, shard_name, shard_id)
+            ("gate_up_proj", "gate_proj", 0),
+            ("gate_up_proj", "up_proj", 1),
+        ]
+
+        # Params for weights, fp8 weight scales, fp8 activation scales
+        # (param_name, weight_name, expert_id, shard_id)
+        expert_params_mapping = FusedMoE.make_expert_params_mapping(
+            ckpt_gate_proj_name="gate_proj",
+            ckpt_down_proj_name="down_proj",
+            ckpt_up_proj_name="up_proj",
+            num_experts=self.config.n_routed_experts)
+
+        params_dict = dict(self.named_parameters())
+        # loaded_params: Set[str] = set()
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # import time
+        # if get_tensor_model_parallel_rank()==0:
+        #     import rpdb; rpdb.set_trace()
+        # else:
+        #     time.sleep(1000000)
+
+        count = 0
+        for name, loaded_weight in weights:
+            print(count, name)
+            count = count + 1
+            if count > 10:
+                break
+
+            if "rotary_emb.inv_freq" in name:
+                continue
+
+            spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+            if spec_layer is not None:
+                continue  # skip spec decode layers for main model
+
+            for (param_name, weight_name, shard_id) in stacked_params_mapping:
+                # Skip non-stacked layers and experts (experts handled below).
+                if weight_name not in name:
+                    continue
+                # We have mlp.experts[0].gate_proj in the checkpoint.
+                # Since we handle the experts below in expert_params_mapping,
+                # we need to skip here BEFORE we update the name, otherwise
+                # name will be updated to mlp.experts[0].gate_up_proj, which
+                # will then be updated below in expert_params_mapping
+                # for mlp.experts[0].gate_gate_up_proj, which breaks load.
+                if (("mlp.experts." in name) and name not in params_dict):
+                    continue
+                name = name.replace(weight_name, param_name)
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
+
+                if is_pp_missing_parameter(name, self):
+                    continue
+
+                if name not in params_dict:
+                        continue
+
+                param = params_dict[name]
+                weight_loader = param.weight_loader
+                weight_loader(param, loaded_weight, shard_id)
+                break
+            else:
+                for mapping in expert_params_mapping:
+                    param_name, weight_name, expert_id, shard_id = mapping
+                    if weight_name not in name:
+                        continue
+                    name = name.replace(weight_name, param_name)
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = param.weight_loader
+                    weight_loader(param,
+                                  loaded_weight,
+                                  name,
+                                  shard_id=shard_id,
+                                  expert_id=expert_id)
+                    break
+                else:
+                    # Skip loading extra bias for GPTQ models.
+                    if name.endswith(".bias") and name not in params_dict:
+                        continue
+
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
+
+                    if is_pp_missing_parameter(name, self):
+                        continue
+
+                    if name not in params_dict:
+                        continue
+
+                    param = params_dict[name]
+                    weight_loader = getattr(param, "weight_loader",
+                                            default_weight_loader)
+                    weight_loader(param, loaded_weight)
+            # loaded_params.add(name)
+
+        # rank0_print("+++++++++++++++ [load_weights] going to post_load_weights")
+        # self.post_load_weights()
+
+        # return loaded_params
+
+    def load_weights_original(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1771,6 +2089,12 @@ class DeepseekV2ForCausalLM(nn.Module):
                             param_name = name.replace(
                                 "q_a_proj", "fused_qkv_a_proj_with_mqa"
                             )
+
+                            # if get_tensor_model_parallel_rank() == 0:
+                            #     import rpdb; rpdb.set_trace()
+                            # else:
+                            #     time.sleep(100000)
+
                             param = params_dict[param_name]
 
                             weight_loader = getattr(
@@ -1798,6 +2122,18 @@ class DeepseekV2ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
+
+
+def get_spec_layer_idx_from_weight_name(config: PretrainedConfig,
+                                        weight_name: str) -> Optional[int]:
+    if hasattr(config,
+               "num_nextn_predict_layers") and (config.num_nextn_predict_layers
+                                                > 0):
+        layer_idx = config.num_hidden_layers
+        for i in range(config.num_nextn_predict_layers):
+            if weight_name.startswith(f"model.layers.{layer_idx+i}."):
+                return layer_idx + i
+    return None
 
 
 class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
