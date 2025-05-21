@@ -507,6 +507,7 @@ class DeepseekV2Attention(nn.Module):
         # TODO, support head_size 192
         self.attn = RadixAttention(
             self.num_local_heads,
+            # self.qk_head_dim,
             256,
             self.scaling,
             num_kv_heads=self.num_local_heads,
@@ -520,6 +521,16 @@ class DeepseekV2Attention(nn.Module):
         forward_batch: ForwardBatch,
         **kwargs
     ) -> torch.Tensor:
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # import time
+        # if get_tensor_model_parallel_rank()==0:
+        #     import rpdb; rpdb.set_trace()
+        # else:
+        #     time.sleep(1000000)
+
+        print("***", self.q_lora_rank, hidden_states.shape)
+
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
             q = self.q_a_layernorm(q)
@@ -528,8 +539,11 @@ class DeepseekV2Attention(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
+        print("***", q.shape)
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
+        print("*** input hidden state", hidden_states.shape)
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+        print("*** output latent", latent_cache.shape)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
@@ -1596,6 +1610,7 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
+            print("layer_id", i, "layer", layer)
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
@@ -1818,7 +1833,21 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         # loaded_params: Set[str] = set()
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # import time
+        # if get_tensor_model_parallel_rank()==0:
+        #     import rpdb; rpdb.set_trace()
+        # else:
+        #     time.sleep(1000000)
+
+        count = 0
         for name, loaded_weight in weights:
+            print(count, name)
+            count = count + 1
+            if count > 10:
+                break
+
             if "rotary_emb.inv_freq" in name:
                 continue
 
