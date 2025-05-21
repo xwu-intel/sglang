@@ -64,12 +64,14 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     print_warning_once,
     set_weight_attrs,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 if _is_hip:
     from aiter import ActivationType
@@ -305,6 +307,19 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if _is_hpu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import pad_block_fp8_weight_naive
+                weight, orig_M, orig_N = pad_block_fp8_weight_naive(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size)
+
+                layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32), requires_grad=False)
+                orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32), requires_grad=False)
+                layer.register_parameter("orig_M", orig_M)
+                layer.register_parameter("orig_N", orig_N)
+
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_hip:
                 # activation_scheme: dynamic
@@ -415,6 +430,19 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            if _is_hpu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import apply_block_fp8_linear_hpu_dequant
+                return apply_block_fp8_linear_hpu_dequant(
+                    input=x,
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                    bias=bias,
+                    original_M=layer.orig_M,
+                    original_N=layer.orig_N,
+                )
+
             return apply_w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
