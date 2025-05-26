@@ -529,7 +529,7 @@ class DeepseekV2Attention(nn.Module):
         # else:
         #     time.sleep(1000000)
 
-        print("***", self.q_lora_rank, hidden_states.shape)
+        # print("***", self.q_lora_rank, hidden_states.shape)
 
         if self.q_lora_rank is not None:
             q = self.q_a_proj(hidden_states)[0]
@@ -539,11 +539,11 @@ class DeepseekV2Attention(nn.Module):
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
             )
-        print("***", q.shape)
+        # print("***", q.shape)
         _, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        print("*** input hidden state", hidden_states.shape)
+        # print("*** input hidden state", hidden_states.shape)
         latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
-        print("*** output latent", latent_cache.shape)
+        # print("*** output latent", latent_cache.shape)
         kv_a, _ = latent_cache.split([self.kv_lora_rank, self.qk_rope_head_dim], dim=-1)
         latent_cache = latent_cache.unsqueeze(1)
         kv_a = self.kv_a_layernorm(kv_a.contiguous())
@@ -1610,7 +1610,7 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
-            print("layer_id", i, "layer", layer)
+            # print("layer_id", i, "layer", layer)
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
@@ -1843,7 +1843,8 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         count = 0
         for name, loaded_weight in weights:
-            print(count, name)
+            # TODO: remove this after we fix the issue with DeepseekV2ForCausalLM
+            print("Loading weight for ", count, name)
             count = count + 1
             if count > 10:
                 break

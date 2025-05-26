@@ -309,6 +309,8 @@ class FusedMoE(torch.nn.Module):
         topk_group: Optional[int] = None,
         quant_config: Optional[QuantizationConfig] = None,
         tp_size: Optional[int] = None,
+        ep_size: Optional[int] = None,
+        dp_size: Optional[int] = None,
         prefix: str = "",
         custom_routing_function: Optional[Callable] = None,
         correction_bias: Optional[torch.Tensor] = None,
@@ -327,6 +329,17 @@ class FusedMoE(torch.nn.Module):
         self.tp_size = (
             tp_size if tp_size is not None else get_tensor_model_parallel_world_size()
         )
+
+        # TODO: dp
+        self.dp_size = 1
+        self.dp_rank = 0
+        # self.dp_size = (dp_size
+        #                 if dp_size is not None else get_dp_group().world_size)
+        # self.dp_rank = (0
+        #                 if self.dp_size == 1 else get_dp_group().rank_in_group)
+
+        self.global_num_experts = num_experts
+
         self.routed_scaling_factor = routed_scaling_factor
         self.top_k = top_k
         self.num_experts = num_experts
