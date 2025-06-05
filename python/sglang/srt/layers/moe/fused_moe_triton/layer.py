@@ -671,6 +671,8 @@ class FusedMoE(torch.nn.Module):
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
 
+        print("FusedMoe forward called", hidden_states)
+
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(
             layer=self,

@@ -81,7 +81,8 @@ class HPUAttnBackend(AttentionBackend):
             fsdpa_op=self.fused_scaled_dot_product_attention,
         )
 
-        output = output.reshape(q.shape)
+        # output = output.reshape(q.shape)
+        output = output.reshape(q.shape[0], q.shape[1], v.shape[2])
 
         return output
 

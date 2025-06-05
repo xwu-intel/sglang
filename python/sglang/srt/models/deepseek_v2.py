@@ -127,9 +127,6 @@ class AttnForwardMethod(IntEnum):
     # This method can avoid OOM when prefix lengths are long.
     MHA_CHUNKED_KV = auto()
 
-    HPU_ATTN = auto()
-
-
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -307,6 +304,8 @@ class DeepseekV2MoE(nn.Module):
     def forward(
         self, hidden_states: torch.Tensor, forward_mode: Optional[ForwardMode] = None
     ) -> torch.Tensor:
+        print("DeepseekV2MoE forward:", hidden_states)
+
         if not global_server_args_dict["enable_deepep_moe"]:
             return self.forward_normal(hidden_states)
         else:
@@ -522,17 +521,13 @@ class DeepseekV2Attention(nn.Module):
         **kwargs
     ) -> torch.Tensor:
 
-        # from sglang.srt.distributed import get_tensor_model_parallel_rank
-        # import time
-        # if get_tensor_model_parallel_rank()==0:
-        #     import rpdb; rpdb.set_trace()
-        # else:
-        #     time.sleep(1000000)
-
-        # print("***", self.q_lora_rank, hidden_states.shape)
+        print("********")
+        print("Layer", self.layer_id, "DeepseekV2Attention forward:", hidden_states)
 
         if self.q_lora_rank is not None:
+            print("self.q_a_proj(hidden_states)[0]")
             q = self.q_a_proj(hidden_states)[0]
+            print("self.q_a_proj(hidden_states)[0] result", q)
             q = self.q_a_layernorm(q)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         else:
@@ -565,7 +560,14 @@ class DeepseekV2Attention(nn.Module):
         v = torch.nn.functional.pad(v, [0, 256 - self.v_head_dim], value=0).view(
             -1, self.num_local_heads * 256
         )
+
+        # print("Q", q)
+        # print("K", k)
+        # print("V", v)
+
         attn_output = self.attn(q, k, v, forward_batch)
+        print(attn_output)
+
         attn_output = attn_output.view(-1, self.num_local_heads, 256)[
             ..., : self.v_head_dim
         ].reshape(-1, self.num_local_heads * self.v_head_dim)
@@ -691,8 +693,6 @@ class DeepseekV2AttentionMLA(nn.Module):
             self.scaling = self.scaling * mscale * mscale
         else:
             self.rotary_emb.forward = self.rotary_emb.forward_native
-
-        # import rpdb; rpdb.set_trace()
 
         self.attn_mqa = RadixAttention(
             self.num_local_heads,
@@ -1412,6 +1412,10 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: Optional[torch.Tensor],
         zero_allocator: BumpAllocator,
     ) -> torch.Tensor:
+
+        #debug
+        print("forward_ffn_with_full_input called")
+
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
@@ -1425,6 +1429,9 @@ class DeepseekV2DecoderLayer(nn.Module):
                 self.attn_tp_size != 1 and self.input_is_scattered
             ), "moe_layer_freq > 1 is not supported when attn_tp_size > 1"
 
+            # debug
+            print("self_attn IN hidden_states:", hidden_states)
+            # print(self.self_attn)
             # Self Attention
             hidden_states = self.self_attn(
                 positions=positions,
@@ -1432,6 +1439,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 forward_batch=forward_batch,
                 zero_allocator=zero_allocator,
             )
+            print("self_attn OUT hidden_states:", hidden_states)
 
         # Gather
         if get_tensor_model_parallel_world_size() > 1:
@@ -1610,10 +1618,14 @@ class DeepseekV2Model(nn.Module):
         for i in range(len(self.layers)):
             expert_distribution_recorder.set_current_layer(i)
             layer = self.layers[i]
-            # print("layer_id", i, "layer", layer)
+
+            # print debug info
+            # print("layer id", i, "input hidden_states", hidden_states)
             hidden_states, residual = layer(
                 positions, hidden_states, forward_batch, residual, zero_allocator
             )
+            # print("layer id", i, "output hidden_states", hidden_states)
+
         if not forward_batch.forward_mode.is_idle():
             if residual is None:
                 hidden_states = self.norm(hidden_states)
@@ -1699,6 +1711,7 @@ class DeepseekV2ForCausalLM(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
+
 
         hidden_states = self.model(input_ids, positions, forward_batch, input_embeds)
 
@@ -1816,7 +1829,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.w_vc = w_vc.contiguous()
                 self_attn.use_deep_gemm_bmm = True
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights_buggy(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -1931,7 +1944,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         # return loaded_params
 
-    def load_weights_original(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("gate_up_proj", "gate_proj", 0),
@@ -2006,7 +2019,15 @@ class DeepseekV2ForCausalLM(nn.Module):
         cached_a_proj = {} if fuse_qkv_a_proj else None
 
         params_dict = dict(self.named_parameters())
+
+        count = 0
         for name, loaded_weight in weights:
+            # TODO: remove this after we fix the issue with DeepseekV2ForCausalLM
+            print("Loading weight for", count, name)
+            count = count + 1
+            if count > 10:
+                break
+
             # TODO(HandH1998): Modify it when nextn is supported.
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2083,8 +2104,9 @@ class DeepseekV2ForCausalLM(nn.Module):
 
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
+
                             fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
+                               [q_a_proj_weight, kv_a_proj_weight], dim=0
                             )
 
                             param_name = name.replace(
@@ -2111,7 +2133,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        self.post_load_weights()
+        # don't do post_load_weights when disable MLA
+        # self.post_load_weights()
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

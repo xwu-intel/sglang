@@ -332,6 +332,9 @@ class Fp8LinearMethod(LinearMethodBase):
                 layer.register_parameter("input_scale", None)
 
     def process_weights_after_loading(self, layer: Module) -> None:
+
+        print("*** Fp8LinearMethod process_weights_after_loading ***")
+
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
             if _is_hpu:
@@ -523,7 +526,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if _is_hpu and self.quant_config.activation_scheme == "static":
+            print("*** Fp8LinearMethod apply x", x)
+            print("layer.input_scale", layer.input_scale, "1.0/layer.input_scale", 1.0/layer.input_scale)
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/layer.input_scale, False, False, torch.float8_e4m3fn)[0]
+            print("*** Fp8LinearMethod x_fp8", x_fp8)
+
             return torch.ops.hpu.fp8_gemm_v2(
                 A=x_fp8,
                 trans_A=False,
@@ -537,6 +544,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 accumulate=False)
 
         return apply_fp8_linear(
+
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -587,7 +595,7 @@ class Fp8MoEMethod:
 
         self.moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 8))
         self.enable_dmoe_dynamic_scale = os.environ.get("VLLM_DMOE_DYNAMIC_SCALE", False) in ["1", "true"]
-        self.use_static_moe = os.environ.get("VLLM_USE_STATIC_MOE", "0") in ["1", "true"]
+        self.use_static_moe = os.environ.get("VLLM_USE_STATIC_MOE", "1") in ["1", "true"]
         self.optimize_with_partial_experts = os.environ.get("VLLM_OPTIMIZE_WITH_PARTIAL_EXPERTS", "0") in ["1", "true"]
 
     def create_weights(
@@ -1242,7 +1250,7 @@ class Fp8MoEMethod:
         # print("**** x shape", x.shape)
 
         # batch_size, seq_len, hidden_dim = x.shape
-        seq_len, hidden_dim = x.shape
+        _, hidden_dim = x.shape
 
         num_experts = layer.local_num_experts
         n_expert_slice = num_experts // self.moe_n_slice
