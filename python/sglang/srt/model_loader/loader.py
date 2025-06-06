@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     get_device_capability,
     is_pin_memory_available,
     set_weight_attrs,
+    is_hpu,
 )
 
 
@@ -73,7 +74,7 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
-        if p.device.type == "cpu":
+        if p.device.type == "cpu" and target_device.type != "hpu":
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
         # Parameters already on target device are not touched
