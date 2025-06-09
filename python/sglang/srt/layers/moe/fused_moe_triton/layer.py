@@ -462,6 +462,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.tensor,
         tp_rank: int,
+        expert_id: int,
+        load_full_w2: bool = False
     ):
         # Load grouped weight scales for group quantization
         # or model weights
@@ -472,6 +474,8 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=expert_id,
+                load_full=load_full_w2,
             )
         elif shard_id in ("w1", "w3"):
             self._load_w13(
@@ -480,6 +484,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=expert_id,
             )
 
     def _load_per_channel_weight_scale(
@@ -489,6 +494,7 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.tensor,
         tp_rank: int,
+        expert_id: int,
     ):
         # for per channel weight quantization
         if shard_id == "w2":
@@ -500,6 +506,7 @@ class FusedMoE(torch.nn.Module):
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
                 tp_rank=tp_rank,
+                expert_id=expert_id,
             )
 
     def _load_w13(
@@ -509,8 +516,10 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.tensor,
         tp_rank: int,
+        expert_id: Optional[int] = None
     ):
 
+        orig_exp_data = expert_data.view(expert_data.size())
         # Index the loaded weight for tp sharding.
         # gate_up_proj: "MergedColumnParallel", so tp sharding on output_dim
         shard_size = expert_data.shape[shard_dim] // 2
@@ -530,6 +539,9 @@ class FusedMoE(torch.nn.Module):
             expert_data = expert_data.narrow(shard_dim, shard_size, shard_size)
         expert_data.copy_(loaded_weight)
 
+        if _is_hpu:
+            self.hpu_fused_moe.MoeOp.w13_list[expert_id].set_weight(orig_exp_data)
+
     def _load_w2(
         self,
         expert_data: torch.Tensor,
@@ -537,6 +549,8 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         loaded_weight: torch.tensor,
         tp_rank: int,
+        expert_id: Optional[int] = None,
+        load_full: bool = False,
     ):
 
         # Index the loaded weight for tp sharding.
@@ -544,13 +558,16 @@ class FusedMoE(torch.nn.Module):
         # Narrow parameter and load.
         shard_size = expert_data.shape[shard_dim]
 
-        if not self.use_presharded_weights:
+        if not load_full: # if not self.use_presharded_weights:
             loaded_weight = loaded_weight.narrow(
                 shard_dim, shard_size * tp_rank, shard_size
             )
 
         # w2, down_proj: Load into only logical weight of w2.
         expert_data.copy_(loaded_weight)
+
+        if _is_hpu:
+            self.hpu_fused_moe.MoeOp.w2_list[expert_id].set_weight(expert_data)
 
     def _load_single_value(
         self, param: torch.nn.Parameter, loaded_weight: torch.Tensor, expert_id: int
@@ -581,6 +598,12 @@ class FusedMoE(torch.nn.Module):
             assert shard_id in ("w1", "w3")
             expert_data.copy_(loaded_weight)
 
+    def _map_global_expert_id_to_local_expert_id(self, expert_id: int) -> int:
+        if self.expert_map is None:
+            return expert_id
+        # rank0_print(f">>>>>>>>>>>> [_map_global_expert_id_to_local_expert_id] expert_id = {expert_id}")
+        return self.expert_map[expert_id].item()
+
     def weight_loader(
         self,
         param: torch.nn.Parameter,
@@ -589,6 +612,10 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        expert_id = self._map_global_expert_id_to_local_expert_id(expert_id)
+        if expert_id == -1:
+            return
+
         # compressed-tensors checkpoints with packed weights are stored flipped
         # TODO (mgoin): check self.quant_method.quant_config.quant_format
         # against known CompressionFormat enum values that have this quality
@@ -613,7 +640,7 @@ class FusedMoE(torch.nn.Module):
         SHARD_ID_TO_SHARDED_DIM = {"w1": 0, "w2": 1, "w3": 0}
 
         expert_data = param.data[expert_id]
-        tp_rank = get_tensor_model_parallel_rank()
+        # tp_rank = get_tensor_model_parallel_rank()
 
         # is_transposed: if the dim to shard the weight
         # should be flipped. Required by GPTQ, compressed-tensors
@@ -654,7 +681,7 @@ class FusedMoE(torch.nn.Module):
                 shard_id=shard_id,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
+                tp_rank=self.tp_rank,
             )
             return
 
@@ -676,7 +703,8 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
+                    tp_rank=self.tp_rank,
+                    expert_id=expert_id,
                 )
             elif quant_method in [
                 FusedMoeWeightScaleSupported.GROUP.value,
@@ -687,7 +715,9 @@ class FusedMoE(torch.nn.Module):
                     shard_dim=shard_dim,
                     loaded_weight=loaded_weight,
                     expert_data=expert_data,
-                    tp_rank=tp_rank,
+                    tp_rank=self.tp_rank,
+                    expert_id=expert_id,
+                    load_full_w2=getattr(param, "load_full_w2", False),
                 )
             elif quant_method == FusedMoeWeightScaleSupported.TENSOR.value:
                 # INT4-FP8 (INT4 MoE Weight, FP8 Compute): Adjust FP8 per-tensor scaling number for e4m3fnuz (AMD)
@@ -721,7 +751,8 @@ class FusedMoE(torch.nn.Module):
                 shard_dim=shard_dim,
                 loaded_weight=loaded_weight,
                 expert_data=expert_data,
-                tp_rank=tp_rank,
+                tp_rank=self.tp_rank,
+                expert_id=expert_id,
             )
             return
 
@@ -744,6 +775,7 @@ class FusedMoE(torch.nn.Module):
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
             routed_scaling_factor=self.routed_scaling_factor,
+            ep_rank=self.ep_rank,
         )
 
         if self.reduce_results and self.tp_size > 1:

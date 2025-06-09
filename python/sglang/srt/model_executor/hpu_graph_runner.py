@@ -267,7 +267,7 @@ class HPUGraphRunner:
                 HPUAdapter(self.model_runner.model, self.model_runner.dtype),
                 disable_tensor_cache=True,
             )
-            if htorch.utils.internal.is_lazy()
+            if htorch.utils.internal.is_lazy() and False
             else HPUAdapter(self.model_runner.model, self.model_runner.dtype)
         )
         # Capture

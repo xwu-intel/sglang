@@ -279,7 +279,7 @@ class Fp8LinearMethod(LinearMethodBase):
         # Otherwise, wait until process_weights_after_loading.
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
-            if not self.block_quant and is_hpu():
+            if not self.block_quant and _is_hpu:
                 scale = ChannelQuantScaleParameter(
                     data=torch.empty(output_size_per_partition,
                                         dtype=torch.float32),
@@ -437,6 +437,17 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
+            assert self.quant_config.weight_block_size is not None
+            from vllm.model_executor.layers.quantization.utils.fp8_utils import apply_block_fp8_linear_hpu_dynamic
+
+            if _is_hpu:
+                return apply_block_fp8_linear_hpu_dynamic(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=layer.input_scale,
+                    bias=bias,
+                )
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
@@ -445,6 +456,28 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
             )
+
+        if _is_hpu and self.quant_config.activation_scheme == "dynamic":
+            return apply_block_fp8_linear_hpu_dynamic(
+                input=x,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale_inv,
+                input_scale=layer.input_scale,
+                bias=bias,
+            )
+        if _is_hpu and self.quant_config.activation_scheme == "static":
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/layer.input_scale, False, False, torch.float8_e4m3fn)[0]
+            return torch.ops.hpu.fp8_gemm_v2(
+                A=x_fp8,
+                trans_A=False,
+                B=layer.weight,
+                trans_B=True,
+                D=None,
+                out_dtype=x.dtype,
+                A_scale_inv=layer.input_scale,
+                B_scale_inv=layer.weight_scale_inv,
+                bias=bias,
+                accumulate=False)
 
         return apply_fp8_linear(
             input=x,
@@ -568,7 +601,16 @@ class Fp8MoEMethod:
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
         # WEIGHT_SCALES
-        if self.block_quant:
+        if _is_hpu and not self.block_quant:
+            w13_weight_scale = torch.nn.Parameter(data=torch.ones(
+                num_experts, 2 * intermediate_size, dtype=torch.float32),
+                                                    requires_grad=False)
+            w2_weight_scale = torch.nn.Parameter(data=torch.ones(
+                num_experts, hidden_size, dtype=torch.float32),
+                                                    requires_grad=False)
+            layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+            layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+        elif self.block_quant:
             w13_weight_scale = torch.nn.Parameter(
                 torch.ones(
                     num_experts,
@@ -674,11 +716,19 @@ class Fp8MoEMethod:
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        if self.block_quant:
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            )
+        else:
+            if _is_hpu:
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+                )
+            else:
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+                )
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
@@ -844,6 +894,15 @@ class Fp8MoEMethod:
                     layer.w2_input_scale = torch.nn.Parameter(
                         w2_input_scale, requires_grad=False
                     )
+            if _is_hpu:
+                if self.quant_config.activation_scheme == "static":
+                    num_experts = layer.w13_weight.shape[0]
+                    self.w13_weight_list = [layer.w13_weight.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_list = [layer.w2_weight.data[i,...] for i in range(num_experts)]
+                    self.w13_weight_scale_list = [layer.w13_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_scale_list = [layer.w2_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_input_scale_list = [layer.w2_input_scale.data.unsqueeze(0).repeat(num_experts)[i] for i in range(num_experts)]
+                return
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             assert layer.w13_weight_scale is not None
@@ -945,6 +1004,328 @@ class Fp8MoEMethod:
             )
             torch.cuda.empty_cache()
 
+    def forward_hpu(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        use_grouped_topk: bool,
+        top_k: int,
+        router_logits: torch.Tensor,
+        renormalize: bool,
+        topk_group: Optional[int] = None,
+        num_expert_group: Optional[int] = None,
+        custom_routing_function: Optional[Callable] = None,
+        correction_bias: Optional[torch.Tensor] = None,
+        routed_scaling_factor: Optional[float] = None,
+        ep_rank: int =0,
+    ):
+        # for name, param in layer.named_parameters():
+        #     rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] parameter name: {name}, shape: {param.shape}, use_grouped_topk: {use_grouped_topk}, top_k: {top_k}, renormalize: {renormalize}, topk_group: {topk_group}, num_expert_group: {num_expert_group}")
+
+        batch_size = 1
+        seq_len, hidden_dim = x.shape
+        num_experts = layer.local_num_experts
+        # print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] num_experts = {num_experts}, x.shape = {x.shape}, router_logits.shape = {router_logits.shape}", flush=True)
+        moe_n_slice = 8
+        n_expert_slice = num_experts // moe_n_slice
+        # num_experts = layer.w13_weight.shape[0]
+        # n_expert_slice = layer.w13_weight.shape[0] // self.moe_n_slice
+        assert n_expert_slice * moe_n_slice == num_experts
+        x = x.view(-1, hidden_dim)
+        total_num_experts = router_logits.size(-1)
+        if seq_len == 1 and (num_experts == total_num_experts) and (batch_size * top_k <= 64):
+            # conditionining on 1. not pre_dequant, 2. decode phase, 3. not with EP>1 4. Batch_size < 8
+            use_partial_experts = True if self.optimize_with_partial_experts else False
+        else:
+            use_partial_experts = False
+
+        from sglang.srt.layers.moe.topk import select_experts
+
+        topk_weights, topk_ids = select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            correction_bias=correction_bias,
+            routed_scaling_factor=routed_scaling_factor)
+
+        ep_shift = ep_rank * num_experts
+        use_static_moe = False # self.use_static_moe
+        # rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] topk_weights.shape = {topk_weights.shape}, topk_ids.shape = {topk_ids.shape}, num_experts = {num_experts}, ep_shift = {ep_shift}, use_static_moe = {use_static_moe}")
+
+        def do_static_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, total_num_experts, num_experts, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
+            rank0_print("calling do_static_moe_with_dynamic_scaling in forward_hpu")
+            x_fp8, x_scale = dynamic_quant(x)
+            # padded_weights shape is (total_num_experts, num_tokens)
+            experts_mask = torch.zeros((x.size(0), total_num_experts), dtype=x.dtype, device=x.device)
+            experts_mask.scatter_(-1, topk_ids, topk_weights)
+            experts_mask = experts_mask.transpose(0, 1)
+
+            if seq_len > 1:
+                mask_weights = torch.zeros((x_fp8.size(0), total_num_experts), dtype=x.dtype, device=x.device)
+                mask_weights.scatter_(-1, topk_ids, 1)
+                mask_weights = mask_weights.transpose(0, 1)
+
+            for i in range(num_experts):
+                w13_weight_fp8_slice = w13_weight_fp8[i, ...]
+                w2_weight_fp8_slice = w2_weight_fp8[i, ...]
+                w13_scale_fp8_slice = w13_weight_scale_inv_fp8[i, ...]
+                w2_scale_fp8_slice = w2_weight_scale_inv_fp8[i, ...]
+
+                if seq_len > 1:
+                    mask_weight = mask_weights[i + ep_shift].unsqueeze(1)
+                    current_state_static = x_fp8 * mask_weight.to(torch.float8_e4m3fn)
+                else:
+                    current_state_static = x_fp8
+
+                up_gate_states = torch.ops.hpu.fp8_gemm_v2(
+                    A=current_state_static,
+                    trans_A=False,
+                    B=w13_weight_fp8_slice,
+                    trans_B=True,
+                    D=None,
+                    out_dtype=torch.bfloat16,
+                    A_scale_inv=x_scale,
+                    B_scale_inv=w13_scale_fp8_slice,
+                    bias=None,
+                    accumulate=False)
+
+                d = up_gate_states.shape[-1] // 2
+                current_state_static = F.silu(up_gate_states[..., :d]) * up_gate_states[..., d:]
+
+                current_state_static, current_state_static_scale = dynamic_quant(current_state_static)
+                current_hidden_states = torch.ops.hpu.fp8_gemm_v2(
+                    current_state_static,
+                    False,
+                    w2_weight_fp8_slice,
+                    True,
+                    None,
+                    torch.bfloat16,
+                    current_state_static_scale,
+                    w2_scale_fp8_slice,
+                    None,
+                    False,
+                )
+                padded_weight = experts_mask[i + ep_shift].unsqueeze(1)
+                if i == 0:
+                    final_hidden_states = current_hidden_states * padded_weight
+                else:
+                    final_hidden_states.add_(current_hidden_states * padded_weight)
+
+            return final_hidden_states
+
+        def do_dynamic_moe_with_static_scaling_new(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8):
+            x_scale = layer.w13_input_scale.data
+            if layer.dp_size == 1:
+                x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
+            else:
+                x_fp8 = x
+            topk_weights = topk_weights.to(torch.bfloat16)
+            batched_tokens = x.shape[0]
+            selected_experts = (topk_ids.to(torch.int64) - ep_shift)
+            if batched_tokens > self.moe_slice_length:
+                final_hidden_states_list = []
+                n_slice = (batched_tokens + self.moe_slice_length -
+                           1) // self.moe_slice_length
+                for i in range(n_slice):
+                    s = i * self.moe_slice_length
+                    e = batched_tokens if i == (n_slice -
+                                    1) else (i + 1) * self.moe_slice_length
+                    current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                        hidden_states=x_fp8[s:e, ...],
+                        expert_routing_table=selected_experts[s:e, ...],
+                        router_weights=topk_weights[s:e, ...],
+                        w12=self.w13_weight_list,
+                        w3=self.w2_weight_list,
+                        d_scale_hidden_states=x_scale,
+                        d_scale_intermediate_hidden_states=self.w2_input_scale_list,
+                        d_scale_w12=self.w13_weight_scale_list,
+                        d_scale_w3=self.w2_weight_scale_list,
+                        permuted_weights=True,
+                        activation="silu",
+                        experts_min=0,
+                        experts_max=(num_experts - 1),
+                    )
+                    final_hidden_states_list.append(current_hidden_states)
+                final_hidden_states = torch.cat(final_hidden_states_list, dim=0)
+            else:
+                final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                    hidden_states=x_fp8,
+                    expert_routing_table=selected_experts,
+                    router_weights=topk_weights,
+                    w12=self.w13_weight_list,
+                    w3=self.w2_weight_list,
+                    d_scale_hidden_states=x_scale,
+                    d_scale_intermediate_hidden_states=self.w2_input_scale_list,
+                    d_scale_w12=self.w13_weight_scale_list,
+                    d_scale_w3=self.w2_weight_scale_list,
+                    permuted_weights=True,
+                    activation="silu",
+                    experts_min=0,
+                    experts_max=(num_experts - 1),
+                )
+            return final_hidden_states.view(-1, x.shape[1])
+
+        def do_dynamic_moe_with_static_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8):
+            # print(f">>>>>>>>>>>>>>>>>> [do_dynamic_moe_with_static_scaling] x.shape = {x.shape}, topk_ids.shape = {topk_ids.shape}, topk_weights.shape = {topk_weights.shape}, w13_weight_fp8.shape = {w13_weight_fp8.shape}, w2_weight_fp8.shape = {w2_weight_fp8.shape}, moe_n_slice = {moe_n_slice}, n_expert_slice = {n_expert_slice}, w13_weight_scale_inv_fp8.shape = {w13_weight_scale_inv_fp8.shape}, w2_weight_scale_inv_fp8.shape = {w2_weight_scale_inv_fp8.shape}", flush=True)
+            x_scale = layer.w13_input_scale.data
+
+            # rank0_print(f">>>>>>>>> [do_dynamic_moe_with_static_scaling] values, x = {x}")
+            # rank0_print(f">>>>>>>>> [do_dynamic_moe_with_static_scaling] x.shape = {x.shape}, x_scale = {x_scale}")
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
+
+            """
+            if layer.dp_size == 1:
+                x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
+            else:
+                x_fp8 = x
+            """
+            rank0_print(">>>>>>>>> [do_dynamic_moe_with_static_scaling] meta info, "
+                  f"x_scale.shape = {x_scale.shape}, x_fp8.shape = {x_fp8.shape}, topk_ids.shape = {topk_ids.shape}, "
+                  f"topk_ids.dtype = {topk_ids.dtype}, ep_shift = {ep_shift}, topk_weights.shape = {topk_weights.shape}, "
+                  f"topk_weights.dtype = {topk_weights.dtype}, len(self.w13_weight_list) = {len(self.w13_weight_list)}, "
+                  f"self.w13_weight_list[0].shape = {self.w13_weight_list[0].shape}, self.w13_weight_list[0].dtype = {self.w13_weight_list[0].dtype}, "
+                  f"self.w2_weight_list[0].shape = {self.w2_weight_list[0].shape}, self.w2_weight_list[0].dtype = {self.w2_weight_list[0].dtype}, "
+                  f"self.w2_input_scale_list[0].shape = {self.w2_input_scale_list[0].shape}, self.w2_input_scale_list[0].dtype = {self.w2_input_scale_list[0].dtype}, "
+                  f"self.w13_weight_scale_list[0].shape = {self.w13_weight_scale_list[0].shape}, self.w13_weight_scale_list[0].dtype = {self.w13_weight_scale_list[0].dtype}, "
+                  f"self.w2_weight_scale_list[0].shape = {self.w2_weight_scale_list[0].shape}, self.w2_weight_scale_list[0].dtype = {self.w2_weight_scale_list[0].dtype}, "
+                  f"len(self.w2_weight_list) = {len(self.w2_weight_list)}, len(self.w2_input_scale_list) = {len(self.w2_input_scale_list)}, "
+                  f"len(self.w13_weight_scale_list) = {len(self.w13_weight_scale_list)}, len(self.w2_weight_scale_list) = {len(self.w2_weight_scale_list)}, "
+                  f"num_experts = {num_experts}")
+
+            final_hidden_states = torch.ops.hpu.mixture_of_experts(
+                hidden_states=x_fp8,
+                expert_routing_table=(topk_ids.to(torch.int64) - ep_shift),
+                router_weights=topk_weights.to(x.dtype),
+                w12=self.w13_weight_list,
+                w3=self.w2_weight_list,
+                d_scale_hidden_states=x_scale,
+                d_scale_intermediate_hidden_states=self.w2_input_scale_list,
+                d_scale_w12=self.w13_weight_scale_list,
+                d_scale_w3=self.w2_weight_scale_list,
+                permuted_weights=True,
+                activation="silu",
+                experts_min=0,
+                experts_max=(num_experts - 1),
+            )
+
+            return final_hidden_states.view(-1, x.shape[1])
+
+        def do_dynamic_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
+            rank0_print("calling do_dynamic_moe_with_dynamic_scaling in forward_hpu")
+            x_fp8, x_scale = dynamic_quant(x, single_scale=True)
+            for i in range(moe_n_slice):
+                min_expert = i * n_expert_slice
+                max_expert = (i + 1) * n_expert_slice
+
+                w13_list_slice = [w13_weight_fp8[j, ...] for j in range(min_expert, max_expert)]
+                w2_list_slice = [w2_weight_fp8[j, ...] for j in range(min_expert, max_expert)]
+                w13_weight_scale = [w13_weight_scale_inv_fp8[j, ...] for j in range(min_expert, max_expert)]
+                w2_weight_scale = [w2_weight_scale_inv_fp8[j,...] for j in range(min_expert, max_expert)]
+
+                current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                                            hidden_states=x_fp8,
+                                            expert_routing_table=topk_ids.to(torch.int64),
+                                            router_weights=topk_weights.to(x.dtype),
+                                            w12=w13_list_slice,
+                                            w3=w2_list_slice,
+                                            d_scale_hidden_states=x_scale,
+                                            d_scale_w12=w13_weight_scale,
+                                            d_scale_w3=w2_weight_scale,
+                                            permuted_weights=True,
+                                            activation="silu",
+                                            experts_min=min_expert + ep_shift,
+                                            experts_max=max_expert - 1 + ep_shift)
+                htorch.core.mark_step()
+                if i == 0:
+                    final_hidden_states = current_hidden_states
+                else:
+                    final_hidden_states.add_(current_hidden_states)
+            return final_hidden_states
+
+        def do_dynamic_moe_with_dequant(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
+            rank0_print("calling do_dynamic_moe_with_dequant in forward_hpu")
+            w13_weight = dequant_block_fp8_weight_naive(w13_weight_fp8,
+                                                        w13_weight_scale_inv_fp8,
+                                                        block_size=self.quant_config.weight_block_size,
+                                                        dtype=x.dtype)
+            w2_weight = dequant_block_fp8_weight_naive(w2_weight_fp8,
+                                                    w2_weight_scale_inv_fp8,
+                                                    block_size=self.quant_config.weight_block_size,
+                                                    dtype=x.dtype)
+            for i in range(moe_n_slice):
+                min_expert = i * n_expert_slice
+                max_expert = (i + 1) * n_expert_slice
+
+                w13_list_slice = [w13_weight[j, ...] for j in range(min_expert, max_expert)]
+                w2_list_slice = [w2_weight[j, ...] for j in range(min_expert, max_expert)]
+
+                current_hidden_states = torch.ops.hpu.mixture_of_experts(
+                                            hidden_states=x,
+                                            expert_routing_table=topk_ids.to(torch.int64),
+                                            router_weights=topk_weights.to(x.dtype),
+                                            w12=w13_list_slice,
+                                            w3=w2_list_slice,
+                                            permuted_weights=True,
+                                            activation="silu",
+                                            experts_min=min_expert + ep_shift,
+                                            experts_max=max_expert - 1 + ep_shift)
+                htorch.core.mark_step()
+                if i == 0:
+                    final_hidden_states = current_hidden_states
+                else:
+                    final_hidden_states.add_(current_hidden_states)
+            return final_hidden_states
+
+        # rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] self.quant_config.activation_scheme = {self.quant_config.activation_scheme}, use_partial_experts = {use_partial_experts}")
+        if use_partial_experts:
+            w13_weight_fp8 = layer.w13_weight.index_select(0, topk_ids.view(-1))
+            w13_weight_scale_inv_fp8 = layer.w13_weight_scale_inv.index_select(0, topk_ids.view(-1))
+            w2_weight_fp8 = layer.w2_weight.index_select(0, topk_ids.view(-1))
+            w2_weight_scale_inv_fp8 = layer.w2_weight_scale_inv.index_select(0, topk_ids.view(-1))
+            actual_total_experts = w13_weight_fp8.size(0)
+            topk_ids_dense = torch.arange(actual_total_experts, device=topk_ids.device).view(topk_ids.size(0), topk_ids.size(1))
+            topk_ids = topk_ids_dense
+            actual_num_experts = actual_total_experts
+            moe_n_slice = 4 if actual_total_experts >= 64 else 1
+            n_expert_slice = actual_total_experts // moe_n_slice
+        else:
+            actual_total_experts = total_num_experts
+            actual_num_experts = num_experts
+            # moe_n_slice = self.moe_n_slice
+            n_expert_slice = actual_num_experts // moe_n_slice
+            if False and self.quant_config.enable_runtime_dequant and VLLM_REQUANT_FP8_INC:
+                assert not use_partial_experts, "Partial experts not supported with VLLM_REQUANT_FP8_INC"
+                final_hidden_states = layer.moe_op(
+                    x,
+                    topk_ids.to(torch.int64),
+                    topk_weights.to(x.dtype),
+                )
+                return final_hidden_states.view(-1, x.shape[1])
+            w13_weight_fp8 = layer.w13_weight.data
+            w13_weight_scale_inv_fp8 = layer.w13_weight_scale_inv.data
+            w2_weight_fp8 = layer.w2_weight.data
+            w2_weight_scale_inv_fp8 = layer.w2_weight_scale_inv.data
+
+        if self.quant_config.activation_scheme == "dynamic":
+            if self.quant_config.enable_runtime_dequant:
+                final_hidden_states = do_dynamic_moe_with_dequant(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8)
+            elif not use_static_moe and self.enable_dmoe_dynamic_scale:
+                final_hidden_states = do_dynamic_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8)
+            else:
+                final_hidden_states = do_static_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, actual_total_experts, actual_num_experts, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8)
+        elif self.quant_config.activation_scheme == "static":
+            final_hidden_states = do_dynamic_moe_with_static_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8, w2_weight_scale_inv_fp8)
+        else:
+            raise ValueError("Unknown activation scheme")
+
+        return final_hidden_states.view(-1, x.shape[1])
+
+
     def apply(
         self,
         layer: torch.nn.Module,
@@ -963,9 +1344,24 @@ class Fp8MoEMethod:
         inplace: bool = True,
         no_combine: bool = False,
         routed_scaling_factor: Optional[float] = None,
+        ep_rank: int = 0,
     ) -> torch.Tensor:
         from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts
         from sglang.srt.layers.moe.topk import select_experts
+
+        if _is_hpu:
+            return self.forward_hpu(x=x,
+                            layer=layer,
+                            router_logits=router_logits,
+                            top_k=top_k,
+                            renormalize=renormalize,
+                            use_grouped_topk=use_grouped_topk,
+                            topk_group=topk_group,
+                            num_expert_group=num_expert_group,
+                            custom_routing_function=custom_routing_function,
+                            correction_bias=correction_bias,
+                            routed_scaling_factor=routed_scaling_factor,
+                            ep_rank=ep_rank)
 
         # Expert selection
         topk_weights, topk_ids = select_experts(

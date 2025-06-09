@@ -28,10 +28,11 @@ from sglang.srt.managers.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.managers.schedule_batch import global_server_args_dict
-from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip
+from sglang.srt.utils import get_compiler_backend, is_cuda, is_hip, is_hpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 
 if _is_cuda:
     from sgl_kernel import moe_fused_gate
@@ -39,6 +40,8 @@ if _is_cuda:
 if _is_cuda or _is_hip:
     from sgl_kernel import topk_softmax
 
+if _is_hpu:
+    import habana_frameworks.torch as htorch
 
 def fused_topk_native(
     hidden_states: torch.Tensor,
@@ -352,6 +355,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 num_token_non_padded=num_token_non_padded,
                 expert_location_dispatch_info=expert_location_dispatch_info,
+                compiled=True if not _is_hpu else False
             )
     elif torch_native and custom_routing_function is None:
         assert (
