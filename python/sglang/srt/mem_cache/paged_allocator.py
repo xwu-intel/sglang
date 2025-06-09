@@ -17,6 +17,8 @@ limitations under the License.
 Page-aligned memory pool.
 """
 
+import heapq
+
 import torch
 import triton
 import triton.language as tl
@@ -318,5 +320,119 @@ class PagedTokenToKVPoolAllocator:
         self.free_pages = torch.arange(
             1, self.num_pages + 1, dtype=torch.int64, device=self.device
         )
+        self.is_not_in_free_group = True
+        self.free_group = []
+
+class HeapPagedTokenToKVPoolAllocator:
+
+    def __init__(
+        self,
+        size: int,
+        page_size: int,
+        dtype: torch.dtype,
+        device: str,
+        kvcache: KVCache,
+    ):
+        self.size = size
+        self.dtype = dtype
+        self.device = device
+        self.page_size = page_size
+        self.num_pages = size // page_size
+
+        self.free_pages = list(range(1, self.num_pages + 1))
+        heapq.heapify(self.free_pages)
+        self.is_not_in_free_group = True
+        self.free_group = []
+        self.clear()
+        self.debug_mode = get_bool_env_var("SGLANG_DEBUG_MEMORY_POOL")
+
+        self._kvcache = kvcache
+
+    def available_size(self):
+        return len(self.free_pages) * self.page_size
+
+    def get_kvcache(self):
+        return self._kvcache
+
+    def alloc_extend(
+        self,
+        prefix_lens: torch.Tensor,
+        seq_lens: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        bs = len(prefix_lens)
+        out_indices_list = alloc_extend_kernel_python(
+            prefix_lens,
+            seq_lens,
+            last_loc,
+            self.free_pages,
+            self.page_size,
+        )
+        if out_indices_list is None:
+            return None
+        if self.debug_mode:
+            assert len(out_indices_list) == extend_num_tokens, (
+                f"extend_num_tokens: {extend_num_tokens}, out_indices_list: {out_indices_list}, "
+                f"prefix_lens: {prefix_lens}, seq_lens: {seq_lens}, last_loc: {last_loc}"
+            )
+        out_indices = torch.tensor(
+            out_indices_list, dtype=torch.int64, device=self.device
+        )
+        return out_indices
+
+    def alloc_decode(
+        self,
+        seq_lens: torch.Tensor,
+        last_loc: torch.Tensor,
+    ):
+        bs = len(seq_lens)
+        out_indices_list = alloc_decode_kernel_python(
+            last_loc,
+            self.free_pages,
+            self.page_size,
+        )
+        if out_indices_list is None:
+            return None
+        if self.debug_mode:
+            assert out_indices_list is not None and len(out_indices_list) == bs, (
+                f"bs: {bs}, out_indices_list: {out_indices_list}, "
+                f"last_loc: {last_loc}, seq_lens: {seq_lens}"
+            )
+        out_indices = torch.tensor(
+            out_indices_list, dtype=torch.int64, device=self.device
+        )
+        return out_indices
+
+    def free(self, free_index: torch.Tensor):
+        if free_index.numel() == 0:
+            return
+
+        if self.is_not_in_free_group:
+            free_page_indices = torch.unique(free_index // self.page_size).tolist()
+            for page in free_page_indices:
+                heapq.heappush(self.free_pages, page)
+        else:
+            self.free_group.append(free_index)
+
+    def free_group_begin(self):
+        self.is_not_in_free_group = False
+        self.free_group = []
+
+    def free_group_end(self):
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
+
+    def backup_state(self):
+        return self.free_pages
+
+    def restore_state(self, free_pages):
+        self.free_pages = free_pages
+
+    def clear(self):
+        # The padded slot 0 is used for writing dummy outputs from padded tokens.
+        self.free_pages = list(range(1, self.num_pages + 1))
+        heapq.heapify(self.free_pages)
         self.is_not_in_free_group = True
         self.free_group = []
