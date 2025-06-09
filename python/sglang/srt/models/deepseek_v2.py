@@ -1794,10 +1794,13 @@ class DeepseekV2ForCausalLM(nn.Module):
             use_deep_gemm_bmm = False
             model_dtype = torch.get_default_dtype()
 
+            print(f"post_load_weights, w.dtype = {w.dtype}", flush=True)
             if w.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
+                t = hasattr(self.quant_config, "weight_block_size")
+                print(f"post_load_weights, t = {t}", flush=True)
                 if (
                     hasattr(self.quant_config, "weight_block_size")
                     and self.quant_config.weight_block_size is not None
@@ -1837,7 +1840,7 @@ class DeepseekV2ForCausalLM(nn.Module):
                             weight, weight_scale, weight_block_size
                         )
                         self_attn.w_scale = scale
-                else:
+                elif not hasattr(self.quant_config, "weight_block_size"):
                     if _is_fp8_fnuz:
                         weight, weight_scale, _ = normalize_e4m3fn_to_e4m3fnuz(
                             weight=w,

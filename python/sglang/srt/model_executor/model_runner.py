@@ -1082,7 +1082,7 @@ class ModelRunner:
         elif self.server_args.attention_backend == "hpu_attn_backend":
             from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
 
-            self.attn_backend = HPUAttnBackend(self)
+            return HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 

@@ -84,6 +84,7 @@ HPUForwardBatch = namedtuple(
         "extend_return_logprob",
         "padded_static_len",
         "capture_hidden_mode",
+        "can_run_tbo",
     ],
     defaults=[None, False, -1, CaptureHiddenMode.NULL],
 )
@@ -255,6 +256,7 @@ class HPUGraphRunner:
     def __init__(self, model_runner: ModelRunner):
         # Parse args
         self.model_runner = model_runner
+        print(f">>>>>> [HPUGraphRunner] self.model_runner.attn_backend = {self.model_runner.attn_backend}", flush=True)
         import habana_frameworks.torch as htorch
         import vllm_hpu_extension.environment as environment
 
@@ -321,6 +323,7 @@ class HPUGraphRunner:
             self.model_runner.attn_backend,
             self.model_runner.token_to_kv_pool,
         )
+        print(f">>>>>> [capture_prefill] self.model_runner.attn_backend = {self.model_runner.attn_backend}", flush=True)
         self.model_runner.attn_backend.init_forward_metadata(forward_batch)
         for i in range(3):
             self.model.forward(

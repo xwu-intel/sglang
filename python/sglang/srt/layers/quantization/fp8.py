@@ -33,6 +33,7 @@ from sglang.srt.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.layers.parameter import (
+    ChannelQuantScaleParameter,
     BlockQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
