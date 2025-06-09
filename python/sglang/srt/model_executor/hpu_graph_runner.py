@@ -86,7 +86,7 @@ HPUForwardBatch = namedtuple(
         "capture_hidden_mode",
         "can_run_tbo",
     ],
-    defaults=[None, False, -1, CaptureHiddenMode.NULL],
+    defaults=[None, False, -1, CaptureHiddenMode.NULL, None],
 )
 
 

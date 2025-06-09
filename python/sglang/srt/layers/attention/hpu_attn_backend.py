@@ -69,12 +69,12 @@ class HPUAttnBackend(AttentionBackend):
         value = v.view(1, -1, layer.tp_v_head_num, layer.v_head_dim)
 
         output = ops.prompt_attention(
-            impl="fsdpa",
+            # impl="fsdpa",
             query=query,
             key=key,
             value=value,
             attn_bias=forward_batch.attn_bias,
-            is_causal=False,
+            # is_causal=False,
             p=0.0,
             scale=layer.scaling,
             matmul_qk_op=self.matmul_qk,
@@ -82,7 +82,7 @@ class HPUAttnBackend(AttentionBackend):
             matmul_av_op=self.matmul_av,
             fsdpa_op=self.fused_scaled_dot_product_attention,
         )
-        output = output.reshape(q.shape)
+        output = output.reshape(v.shape)
 
         return output
 
@@ -139,6 +139,7 @@ class HPUAttnBackend(AttentionBackend):
             block_list=forward_batch.block_list,
             block_mapping=forward_batch.block_mapping,
             block_bias=forward_batch.attn_bias,
+            block_scales=None, # not used
             block_groups=forward_batch.block_groups,
             scale=layer.scaling,
             matmul_qk_op=self.matmul_qk,

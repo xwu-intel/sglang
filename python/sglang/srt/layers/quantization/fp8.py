@@ -1020,9 +1020,6 @@ class Fp8MoEMethod:
         routed_scaling_factor: Optional[float] = None,
         ep_rank: int =0,
     ):
-        # for name, param in layer.named_parameters():
-        #     rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] parameter name: {name}, shape: {param.shape}, use_grouped_topk: {use_grouped_topk}, top_k: {top_k}, renormalize: {renormalize}, topk_group: {topk_group}, num_expert_group: {num_expert_group}")
-
         batch_size = 1
         seq_len, hidden_dim = x.shape
         num_experts = layer.local_num_experts
@@ -1056,10 +1053,8 @@ class Fp8MoEMethod:
 
         ep_shift = ep_rank * num_experts
         use_static_moe = False # self.use_static_moe
-        # rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] topk_weights.shape = {topk_weights.shape}, topk_ids.shape = {topk_ids.shape}, num_experts = {num_experts}, ep_shift = {ep_shift}, use_static_moe = {use_static_moe}")
 
         def do_static_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, total_num_experts, num_experts, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
-            rank0_print("calling do_static_moe_with_dynamic_scaling in forward_hpu")
             x_fp8, x_scale = dynamic_quant(x)
             # padded_weights shape is (total_num_experts, num_tokens)
             experts_mask = torch.zeros((x.size(0), total_num_experts), dtype=x.dtype, device=x.device)
@@ -1175,8 +1170,6 @@ class Fp8MoEMethod:
             # print(f">>>>>>>>>>>>>>>>>> [do_dynamic_moe_with_static_scaling] x.shape = {x.shape}, topk_ids.shape = {topk_ids.shape}, topk_weights.shape = {topk_weights.shape}, w13_weight_fp8.shape = {w13_weight_fp8.shape}, w2_weight_fp8.shape = {w2_weight_fp8.shape}, moe_n_slice = {moe_n_slice}, n_expert_slice = {n_expert_slice}, w13_weight_scale_inv_fp8.shape = {w13_weight_scale_inv_fp8.shape}, w2_weight_scale_inv_fp8.shape = {w2_weight_scale_inv_fp8.shape}", flush=True)
             x_scale = layer.w13_input_scale.data
 
-            # rank0_print(f">>>>>>>>> [do_dynamic_moe_with_static_scaling] values, x = {x}")
-            # rank0_print(f">>>>>>>>> [do_dynamic_moe_with_static_scaling] x.shape = {x.shape}, x_scale = {x_scale}")
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/x_scale, False, False, torch.float8_e4m3fn)[0]
 
             """
@@ -1185,18 +1178,6 @@ class Fp8MoEMethod:
             else:
                 x_fp8 = x
             """
-            rank0_print(">>>>>>>>> [do_dynamic_moe_with_static_scaling] meta info, "
-                  f"x_scale.shape = {x_scale.shape}, x_fp8.shape = {x_fp8.shape}, topk_ids.shape = {topk_ids.shape}, "
-                  f"topk_ids.dtype = {topk_ids.dtype}, ep_shift = {ep_shift}, topk_weights.shape = {topk_weights.shape}, "
-                  f"topk_weights.dtype = {topk_weights.dtype}, len(self.w13_weight_list) = {len(self.w13_weight_list)}, "
-                  f"self.w13_weight_list[0].shape = {self.w13_weight_list[0].shape}, self.w13_weight_list[0].dtype = {self.w13_weight_list[0].dtype}, "
-                  f"self.w2_weight_list[0].shape = {self.w2_weight_list[0].shape}, self.w2_weight_list[0].dtype = {self.w2_weight_list[0].dtype}, "
-                  f"self.w2_input_scale_list[0].shape = {self.w2_input_scale_list[0].shape}, self.w2_input_scale_list[0].dtype = {self.w2_input_scale_list[0].dtype}, "
-                  f"self.w13_weight_scale_list[0].shape = {self.w13_weight_scale_list[0].shape}, self.w13_weight_scale_list[0].dtype = {self.w13_weight_scale_list[0].dtype}, "
-                  f"self.w2_weight_scale_list[0].shape = {self.w2_weight_scale_list[0].shape}, self.w2_weight_scale_list[0].dtype = {self.w2_weight_scale_list[0].dtype}, "
-                  f"len(self.w2_weight_list) = {len(self.w2_weight_list)}, len(self.w2_input_scale_list) = {len(self.w2_input_scale_list)}, "
-                  f"len(self.w13_weight_scale_list) = {len(self.w13_weight_scale_list)}, len(self.w2_weight_scale_list) = {len(self.w2_weight_scale_list)}, "
-                  f"num_experts = {num_experts}")
 
             final_hidden_states = torch.ops.hpu.mixture_of_experts(
                 hidden_states=x_fp8,
@@ -1217,7 +1198,6 @@ class Fp8MoEMethod:
             return final_hidden_states.view(-1, x.shape[1])
 
         def do_dynamic_moe_with_dynamic_scaling(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
-            rank0_print("calling do_dynamic_moe_with_dynamic_scaling in forward_hpu")
             x_fp8, x_scale = dynamic_quant(x, single_scale=True)
             for i in range(moe_n_slice):
                 min_expert = i * n_expert_slice
@@ -1249,7 +1229,6 @@ class Fp8MoEMethod:
             return final_hidden_states
 
         def do_dynamic_moe_with_dequant(x, topk_ids, topk_weights, w13_weight_fp8, w2_weight_fp8, moe_n_slice, n_expert_slice, w13_weight_scale_inv_fp8=None, w2_weight_scale_inv_fp8=None):
-            rank0_print("calling do_dynamic_moe_with_dequant in forward_hpu")
             w13_weight = dequant_block_fp8_weight_naive(w13_weight_fp8,
                                                         w13_weight_scale_inv_fp8,
                                                         block_size=self.quant_config.weight_block_size,
@@ -1282,7 +1261,6 @@ class Fp8MoEMethod:
                     final_hidden_states.add_(current_hidden_states)
             return final_hidden_states
 
-        # rank0_print(f">>>>>>>>>>>>>>>>>>>>>>> [forward_hpu] self.quant_config.activation_scheme = {self.quant_config.activation_scheme}, use_partial_experts = {use_partial_experts}")
         if use_partial_experts:
             w13_weight_fp8 = layer.w13_weight.index_select(0, topk_ids.view(-1))
             w13_weight_scale_inv_fp8 = layer.w13_weight_scale_inv.index_select(0, topk_ids.view(-1))

@@ -98,11 +98,13 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 _is_cuda = is_cuda()
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -772,7 +774,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 forward_batch.forward_mode.is_extend()
                 and not forward_batch.forward_mode.is_target_verify()
                 and not forward_batch.forward_mode.is_draft_extend()
-                and sum(forward_batch.extend_prefix_lens_cpu) == 0
+                # and sum(forward_batch.extend_prefix_lens_cpu) == 0
             ):
                 return AttnForwardMethod.MHA
             else:
