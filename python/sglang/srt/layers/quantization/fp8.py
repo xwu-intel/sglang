@@ -2,6 +2,7 @@
 
 import logging
 from typing import Any, Callable, Dict, List, Optional
+import os
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +35,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
+    ChannelQuantScaleParameter,
     ModelWeightParameter,
     PerTensorScaleParameter,
 )
@@ -49,6 +51,7 @@ from sglang.srt.layers.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
+    apply_w8a8_block_fp8_linear,
     cutlass_fp8_supported,
     dispatch_w8a8_block_fp8_linear,
     input_to_float8,
@@ -67,6 +70,8 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
+    is_hpu,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -74,6 +79,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -90,6 +96,7 @@ if not _is_cuda:
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
+VLLM_REQUANT_FP8_INC = os.getenv("VLLM_REQUANT_FP8_INC", "0") in ["1", "true"]
 
 logger = logging.getLogger(__name__)
 
@@ -104,6 +111,7 @@ class Fp8Config(QuantizationConfig):
         ignored_layers: Optional[List[str]] = None,
         weight_block_size: List[int] = None,
     ) -> None:
+        self.enable_runtime_dequant = os.environ.get("VLLM_ENABLE_RUNTIME_DEQUANT", "0") in ["1", "true"]
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
             log_info_on_rank0(logger, "Detected fp8 checkpoint.")
@@ -276,7 +284,23 @@ class Fp8LinearMethod(LinearMethodBase):
         # Otherwise, wait until process_weights_after_loading.
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
-            if self.block_quant:
+            if not self.block_quant and _is_hpu:
+                scale = ChannelQuantScaleParameter(
+                    data=torch.empty(output_size_per_partition,
+                                        dtype=torch.float32),
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale_inv", scale)
+            elif not self.block_quant:
+                scale = PerTensorScaleParameter(
+                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale", scale)
+            else:
                 assert self.quant_config.activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
@@ -289,14 +313,8 @@ class Fp8LinearMethod(LinearMethodBase):
                     weight_loader=weight_loader,
                 )
                 scale[:] = torch.finfo(torch.float32).min
+                # The weight_scale_inv name is intentional for deepseekv3
                 layer.register_parameter("weight_scale_inv", scale)
-            else:
-                scale = PerTensorScaleParameter(
-                    data=torch.empty(len(output_partition_sizes), dtype=torch.float32),
-                    weight_loader=weight_loader,
-                )
-                scale[:] = torch.finfo(torch.float32).min
-                layer.register_parameter("weight_scale", scale)
 
             # INPUT ACTIVATION SCALE
             if self.quant_config.activation_scheme == "static":
@@ -313,6 +331,32 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if _is_hpu:
+                from vllm.model_executor.layers.quantization.utils.fp8_utils import pad_block_fp8_weight_naive
+                weight, orig_M, orig_N = pad_block_fp8_weight_naive(
+                    layer.weight.data,
+                    layer.weight_scale_inv.data,
+                    self.quant_config.weight_block_size)
+
+                if self.quant_config.enable_runtime_dequant:
+                    layer.weight = torch.nn.Parameter(weight, requires_grad=False)
+                    orig_M = torch.nn.Parameter(torch.tensor(orig_M, dtype=torch.int32), requires_grad=False)
+                    orig_N = torch.nn.Parameter(torch.tensor(orig_N, dtype=torch.int32), requires_grad=False)
+                    layer.register_parameter("orig_M", orig_M)
+                    layer.register_parameter("orig_N", orig_N)
+                else:
+                    weight, weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+                            weight,
+                            layer.weight_scale_inv.data,
+                            self.quant_config.weight_block_size,
+                            original_M=orig_M,
+                            original_N=orig_N,
+                            do_unpad=True))
+                    weight_scale_inv = weight_scale_inv.squeeze(-1)
+                    layer.weight.data.copy_(weight)
+                    layer.weight_scale_inv = Parameter(weight_scale_inv,
+                                                    requires_grad=False)
+                    return
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # activation_scheme: dynamic
@@ -332,6 +376,11 @@ class Fp8LinearMethod(LinearMethodBase):
             return
 
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
+        if _is_hpu:
+            if self.quant_config.activation_scheme == "static":
+                layer.input_scale = Parameter(layer.input_scale.max(),
+                                              requires_grad=False)
+            return
 
         # If checkpoint not serialized fp8, quantize the weights.
         if not self.quant_config.is_checkpoint_fp8_serialized:
@@ -419,14 +468,63 @@ class Fp8LinearMethod(LinearMethodBase):
             )
 
         if self.block_quant:
-            return self.w8a8_block_fp8_linear(
+            assert self.quant_config.weight_block_size is not None
+            if _is_hpu:
+                if self.quant_config.enable_runtime_dequant:
+                    return apply_block_fp8_linear_hpu_dequant(
+                        input=x,
+                        weight=layer.weight,
+                        block_size=self.quant_config.weight_block_size,
+                        weight_scale=layer.weight_scale_inv,
+                        input_scale=layer.input_scale,
+                        bias=bias,
+                        original_M=layer.orig_M,
+                        original_N=layer.orig_N,
+                        do_unpad=True,
+                    )
+                else:
+                    return apply_block_fp8_linear_hpu_dynamic(
+                        input=x,
+                        weight=layer.weight,
+                        weight_scale=layer.weight_scale_inv,
+                        input_scale=layer.input_scale,
+                        bias=bias,
+                )
+            else:
+                return apply_w8a8_block_fp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    block_size=self.quant_config.weight_block_size,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                    bias=bias,
+            )
+
+        if _is_hpu and self.quant_config.activation_scheme == "dynamic":
+            return apply_block_fp8_linear_hpu_dynamic(
                 input=x,
                 weight=layer.weight,
-                block_size=self.quant_config.weight_block_size,
                 weight_scale=layer.weight_scale_inv,
-                input_scale=None,
+                input_scale=layer.input_scale,
                 bias=bias,
             )
+        if _is_hpu and self.quant_config.activation_scheme == "static":
+            print("*** Fp8LinearMethod apply x", x)
+            print("layer.input_scale", layer.input_scale, "1.0/layer.input_scale", 1.0/layer.input_scale)
+            x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/layer.input_scale, False, False, torch.float8_e4m3fn)[0]
+            print("*** Fp8LinearMethod x_fp8", x_fp8)
+
+            return torch.ops.hpu.fp8_gemm_v2(
+                A=x_fp8,
+                trans_A=False,
+                B=layer.weight,
+                trans_B=True,
+                D=None,
+                out_dtype=x.dtype,
+                A_scale_inv=layer.input_scale,
+                B_scale_inv=layer.weight_scale_inv,
+                bias=bias,
+                accumulate=False)
 
         return apply_fp8_linear(
             input=x,
@@ -473,6 +571,14 @@ class Fp8MoEMethod:
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.block_quant = self.quant_config.weight_block_size is not None
+        # Slicing the batched tokens for DynamicMoE to reduce the memory consumption
+        self.moe_slice_length = int(os.environ.get("VLLM_MOE_SLICE_LENGTH", 8192))
+
+        self.moe_n_slice = int(os.environ.get("VLLM_MOE_N_SLICE", 8))
+        self.enable_dmoe_dynamic_scale = os.environ.get("VLLM_DMOE_DYNAMIC_SCALE", False) in ["1", "true"]
+        self.use_static_moe = os.environ.get("VLLM_USE_STATIC_MOE", "1") in ["1", "true"]
+        self.optimize_with_partial_experts = os.environ.get("VLLM_OPTIMIZE_WITH_PARTIAL_EXPERTS", "0") in ["1", "true"]
+
         self.cutlass_fp8_supported = cutlass_fp8_supported()
 
     def create_weights(
@@ -628,39 +734,56 @@ class Fp8MoEMethod:
                 self.problem_sizes2 = torch.empty(
                     num_experts, 3, device=w13_weight.device, dtype=torch.int32
                 )
-
         else:
-            # Allocate 2 scales for w1 and w3 respectively.
-            # They will be combined to a single scale after weight loading.
-            w13_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
-            )
-            w2_weight_scale = torch.nn.Parameter(
-                torch.ones(num_experts, dtype=torch.float32), requires_grad=False
-            )
-            layer.register_parameter("w13_weight_scale", w13_weight_scale)
-            layer.register_parameter("w2_weight_scale", w2_weight_scale)
+            if _is_hpu:
+                w13_weight_scale = torch.nn.Parameter(data=torch.ones(
+                    num_experts, 2 * intermediate_size, dtype=torch.float32),
+                                                        requires_grad=False)
+                w2_weight_scale = torch.nn.Parameter(data=torch.ones(
+                    num_experts, hidden_size, dtype=torch.float32),
+                                                        requires_grad=False)
+                layer.register_parameter("w13_weight_scale_inv", w13_weight_scale)
+                layer.register_parameter("w2_weight_scale_inv", w2_weight_scale)
+            else:
+                # Allocate 2 scales for w1 and w3 respectively.
+                # They will be combined to a single scale after weight loading.
+                w13_weight_scale = torch.nn.Parameter(
+                    torch.ones(num_experts, 2, dtype=torch.float32), requires_grad=False
+                )
+                w2_weight_scale = torch.nn.Parameter(
+                    torch.ones(num_experts, dtype=torch.float32), requires_grad=False
+                )
+                layer.register_parameter("w13_weight_scale", w13_weight_scale)
+                layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-            if _is_hip:  # and use_aiter_moe: TODO: add check back after triton kernel
-                # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
-                w13_weight_scale1 = torch.nn.Parameter(
-                    torch.ones(num_experts, 2 * intermediate_size, dtype=torch.float32),
-                    requires_grad=False,
-                )
-                w2_weight_scale1 = torch.nn.Parameter(
-                    torch.ones(num_experts, hidden_size, dtype=torch.float32),
-                    requires_grad=False,
-                )
-                layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
-                layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
+                if _is_hip:  # and use_aiter_moe: TODO: add check back after triton kernel
+                    # ROCm - using column scaling, duplicate scaling numbers in case per tensor scaling
+                    w13_weight_scale1 = torch.nn.Parameter(
+                        torch.ones(num_experts, 2 * intermediate_size, dtype=torch.float32),
+                        requires_grad=False,
+                    )
+                    w2_weight_scale1 = torch.nn.Parameter(
+                        torch.ones(num_experts, hidden_size, dtype=torch.float32),
+                        requires_grad=False,
+                    )
+                    layer.register_parameter("w13_weight_scale1", w13_weight_scale1)
+                    layer.register_parameter("w2_weight_scale1", w2_weight_scale1)
 
         # Add the quantization method used (per tensor/grouped/channel)
         # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-            if self.block_quant
-            else {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
+        if self.block_quant:
+            extra_weight_attrs.update(
+                {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
+            )
+        else:
+            if _is_hpu:
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
+                )
+            else:
+                extra_weight_attrs.update(
+                    {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
+                )
         # If loading fp8 checkpoint, pass the weight loaders.
         # If loading an fp16 checkpoint, do not (we will quantize in
         #   process_weights_after_loading()
@@ -706,6 +829,25 @@ class Fp8MoEMethod:
 
         # Block quant doesn't need to process weights after loading
         if self.block_quant:
+            if _is_hpu:
+                if self.quant_config.enable_runtime_dequant:
+                    return
+                w13_weight, w13_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+                    layer.w13_weight.data,
+                    layer.w13_weight_scale_inv.data,
+                    self.quant_config.weight_block_size))
+                w2_weight, w2_weight_scale_inv = dynamic_quant(dequant_block_fp8_weight_naive(
+                    layer.w2_weight.data,
+                    layer.w2_weight_scale_inv.data,
+                    self.quant_config.weight_block_size))
+                w13_weight_scale_inv, w2_weight_scale_inv = w13_weight_scale_inv.squeeze(-1), w2_weight_scale_inv.squeeze(-1)
+                layer.w13_weight.data.copy_(w13_weight)
+                layer.w2_weight.data.copy_(w2_weight)
+                layer.w13_weight_scale_inv = Parameter(w13_weight_scale_inv,
+                                                       requires_grad=False)
+                layer.w2_weight_scale_inv = Parameter(w2_weight_scale_inv,
+                                                      requires_grad=False)
+                return
             # If ROCm, normalize the weights and scales to e4m3fnuz
             if _is_fp8_fnuz:
                 # activation_scheme: dynamic
@@ -826,6 +968,22 @@ class Fp8MoEMethod:
                     layer.w2_input_scale = torch.nn.Parameter(
                         w2_input_scale, requires_grad=False
                     )
+            if _is_hpu:
+                # from sglang.srt.distributed import get_tensor_model_parallel_rank
+                # import time
+                # if get_tensor_model_parallel_rank()==0:
+                #     import rpdb; rpdb.set_trace()
+                # else:
+                #     time.sleep(1000000)
+
+                if self.quant_config.activation_scheme == "static":
+                    num_experts = layer.w13_weight.shape[0]
+                    self.w13_weight_list = [layer.w13_weight.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_list = [layer.w2_weight.data[i,...] for i in range(num_experts)]
+                    self.w13_weight_scale_list = [layer.w13_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_weight_scale_list = [layer.w2_weight_scale_inv.data[i,...] for i in range(num_experts)]
+                    self.w2_input_scale_list = [layer.w2_input_scale.data.unsqueeze(0).repeat(num_experts)[i] for i in range(num_experts)]
+                return
             # Fp8 moe kernel needs single weight scale for w13 per expert.
             # We take the max then dequant and requant each expert.
             assert layer.w13_weight_scale is not None
