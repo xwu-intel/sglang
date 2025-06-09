@@ -74,7 +74,7 @@ from sglang.srt.mem_cache.memory_pool import (
     TokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.paged_allocator import (
-    HeapPagedTokenToKVPoolAllocator
+    HeapPagedTokenToKVPoolAllocator,
     PagedTokenToKVPoolAllocator
 )
 from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner

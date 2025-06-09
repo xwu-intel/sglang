@@ -67,6 +67,7 @@ from sglang.srt.utils import (
     get_bool_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     log_info_on_rank0,
     print_warning_once,
     set_weight_attrs,
@@ -74,6 +75,7 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 
 _is_fp8_fnuz = is_fp8_fnuz()
 
@@ -85,8 +87,9 @@ if _is_hip:
     from aiter.fused_moe_bf16_asm import asm_moe, ck_moe_2stages
     from aiter.ops.shuffle import shuffle_weight
 
-if not _is_cuda:
-    from vllm._custom_ops import scaled_fp8_quant
+if _is_hpu:
+    import habana_frameworks.torch as htorch
+    from vllm_hpu_extension.ops import scaled_fp8_quant
 
 
 ACTIVATION_SCHEMES = ["static", "dynamic"]
@@ -276,7 +279,16 @@ class Fp8LinearMethod(LinearMethodBase):
         # Otherwise, wait until process_weights_after_loading.
         if self.quant_config.is_checkpoint_fp8_serialized:
             # WEIGHT SCALE
-            if self.block_quant:
+            if not self.block_quant and is_hpu():
+                scale = ChannelQuantScaleParameter(
+                    data=torch.empty(output_size_per_partition,
+                                        dtype=torch.float32),
+                    output_dim=0,
+                    weight_loader=weight_loader,
+                )
+                scale[:] = torch.finfo(torch.float32).min
+                layer.register_parameter("weight_scale_inv", scale)
+            elif self.block_quant:
                 assert self.quant_config.activation_scheme == "dynamic"
                 scale = BlockQuantScaleParameter(
                     data=torch.empty(
@@ -329,6 +341,12 @@ class Fp8LinearMethod(LinearMethodBase):
             layer.weight_scale_inv = torch.nn.Parameter(
                 weight_scale, requires_grad=False
             )
+            return
+
+        if _is_hpu:
+            if self.quant_config.activation_scheme == "static":
+                layer.input_scale = Parameter(layer.input_scale.max(),
+                                              requires_grad=False)
             return
 
         layer.weight = torch.nn.Parameter(layer.weight.data, requires_grad=False)
