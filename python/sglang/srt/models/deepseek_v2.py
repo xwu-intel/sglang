@@ -98,12 +98,14 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 
 if _is_cuda:
@@ -971,13 +973,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                zero_allocator.allocate(1),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+            if _is_hpu:
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16)
+                )
+            else:
+                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                    q_nope.transpose(0, 1),
+                    zero_allocator.allocate(1),
+                )
+                q_nope_out = bmm_fp8(
+                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -1684,6 +1692,15 @@ class DeepseekV2ForCausalLM(nn.Module):
     def determine_num_fused_shared_experts(
         self, architecture: str = "DeepseekV3ForCausalLM"
     ):
+        if _is_hpu:
+            self.num_fused_shared_experts = 0
+            global_server_args_dict["disable_shared_experts_fusion"] = 1
+            log_info_on_rank0(
+                logger,
+                "Shared experts fusion optimization is disabled for HPU."
+            )
+            return
+
         self.num_fused_shared_experts = (
             0
             if global_server_args_dict["disable_shared_experts_fusion"]
@@ -1894,6 +1911,14 @@ class DeepseekV2ForCausalLM(nn.Module):
                 self_attn.use_deep_gemm_bmm = True
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+
+        # from sglang.srt.distributed import get_tensor_model_parallel_rank
+        # import time
+        # if get_tensor_model_parallel_rank()==0:
+        #     import rpdb; rpdb.set_trace()
+        # else:
+        #     time.sleep(1000000)
+
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
@@ -2019,7 +2044,14 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         weight_names = []
+
+        count = 0
         for name, loaded_weight in weights:
+            print("Loading weight for", count, name)
+            count = count + 1
+            if count > 100:
+                break
+
             weight_names.append(name)
 
             if not is_nextn:
