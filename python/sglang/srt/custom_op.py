@@ -1,9 +1,10 @@
 from torch import nn
 
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_hpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_hpu = is_hpu()
 
 
 class CustomOp(nn.Module):
@@ -75,5 +76,7 @@ class CustomOp(nn.Module):
             return self.forward_cuda
         elif _is_hip:
             return self.forward_hip
+        elif _is_hpu:
+            return self.forward_hpu
         else:
             return self.forward_native
