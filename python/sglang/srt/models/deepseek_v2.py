@@ -1810,11 +1810,14 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
             model_dtype = torch.get_default_dtype()
+            print("*********", self.quant_config.weight_block_size, flush=True)
 
             if w.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
+                print("*********", self.quant_config.weight_block_size, flush=True)
+
                 if (
                     hasattr(self.quant_config, "weight_block_size")
                     and self.quant_config.weight_block_size is not None
@@ -2137,16 +2140,20 @@ class DeepseekV2ForCausalLM(nn.Module):
                         ):
                             q_a_proj_weight = cached_a_proj[q_a_proj_name]
                             kv_a_proj_weight = cached_a_proj[kv_a_proj_name]
-                            fused_weight = torch.cat(
-                                [q_a_proj_weight, kv_a_proj_weight], dim=0
-                            )
+
+                            if name.endswith("input_scale"):
+                                fused_weight = q_a_proj_weight
+                            else:
+                                fused_weight = torch.cat(
+                                    [q_a_proj_weight, kv_a_proj_weight], dim=0
+                                )
                             param_name = (
                                 name.replace("q_a_proj", "fused_qkv_a_proj_with_mqa")
                                 if "q_a_proj" in name
                                 else name.replace(
                                     "kv_a_proj_with_mqa", "fused_qkv_a_proj_with_mqa"
                                 )
-                            )
+
                             param = params_dict[param_name]
 
                             weight_loader = getattr(
@@ -2172,7 +2179,8 @@ class DeepseekV2ForCausalLM(nn.Module):
                         )
                         weight_loader(param, loaded_weight)
 
-        self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
+        # TODO: disable for now
+        # self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
