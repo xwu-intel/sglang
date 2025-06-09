@@ -99,12 +99,14 @@ from sglang.srt.utils import (
     get_int_env_var,
     is_cuda,
     is_hip,
+    is_hpu,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
 )
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
+_is_hpu = is_hpu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -992,13 +994,19 @@ class DeepseekV2AttentionMLA(nn.Module):
                 self.w_kc.to(torch.bfloat16) * self.w_scale,
             )
         elif self.w_kc.dtype == torch.float8_e4m3fn:
-            q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
-                q_nope.transpose(0, 1),
-                zero_allocator.allocate(1),
-            )
-            q_nope_out = bmm_fp8(
-                q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
-            )
+            if _is_hpu:
+                q_nope_out = torch.bmm(
+                    q_nope.to(torch.bfloat16).transpose(0, 1),
+                    self.w_kc.to(torch.bfloat16)
+                )
+            else:
+                q_nope_val, q_nope_scale = per_tensor_quant_mla_fp8(
+                    q_nope.transpose(0, 1),
+                    zero_allocator.allocate(1),
+                )
+                q_nope_out = bmm_fp8(
+                    q_nope_val, self.w_kc, q_nope_scale, self.w_scale, torch.bfloat16
+                )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
@@ -2026,6 +2034,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         weight_names = []
+
         for name, loaded_weight in weights:
             if self.num_fused_shared_experts > 0 and "mlp.shared_experts" in name:
                 name = name.replace(
