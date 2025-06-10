@@ -26,6 +26,69 @@ import triton.language as tl
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.utils import get_bool_env_var, next_power_of_2
 
+def alloc_extend_kernel_python(
+    prefix_lens: torch.Tensor,
+    seq_lens: torch.Tensor,
+    last_locs: torch.Tensor,
+    free_pages: list[int],
+    page_size: int,
+):
+    prefix_lens_list = prefix_lens.tolist()
+    seq_lens_list = seq_lens.tolist()
+    last_locs_list = last_locs.tolist()
+    out_indices_list = []
+    for i in range(len(prefix_lens_list)):
+        pre_len = prefix_lens_list[i]
+        seq_len = seq_lens_list[i]
+        last_loc = last_locs_list[i]
+
+        extend_len = seq_len - pre_len
+        remain_len = extend_len
+        if (last_loc + 1) % page_size != 0:
+            next_page_start = (last_loc // page_size + 1) * page_size
+            out_indices_list.extend(range(last_loc + 1, next_page_start))
+            remain_len -= next_page_start - last_loc
+
+        while remain_len >= page_size:
+            if not free_pages:
+                return None
+            page_idx = heapq.heappop(free_pages)
+            out_indices_list.extend(
+                range(page_idx * page_size, (page_idx + 1) * page_size)
+            )
+            remain_len -= page_size
+
+        if remain_len > 0:
+            if not free_pages:
+                return None
+            page_idx = heapq.heappop(free_pages)
+            out_indices_list.extend(
+                range(page_idx * page_size, page_idx * page_size + remain_len)
+            )
+
+    return out_indices_list
+
+
+def alloc_decode_kernel_python(
+    last_locs: torch.Tensor,
+    free_pages: list[int],
+    page_size: int,
+):
+    last_locs_list = last_locs.tolist()
+    out_indices_list = []
+    for i in range(len(last_locs_list)):
+        last_loc = last_locs_list[i]
+
+        if (last_loc + 1) % page_size != 0:
+            out_indices_list.append(last_loc + 1)
+        else:
+            if not free_pages:
+                return None
+            page_idx = heapq.heappop(free_pages)
+            out_indices_list.append(page_idx * page_size)
+
+    return out_indices_list
+
 
 @triton.jit
 def alloc_extend_kernel(

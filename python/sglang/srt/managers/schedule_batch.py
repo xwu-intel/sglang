@@ -1832,7 +1832,7 @@ def get_last_loc(
     req_pool_indices_tensor: torch.Tensor,
     prefix_lens_tensor: torch.Tensor,
 ) -> torch.Tensor:
-    if global_server_args_dict["attention_backend"] != "torch_native":
+    if global_server_args_dict["attention_backend"] not in ["torch_native", "hpu_attn_backend"]:
         impl = get_last_loc_triton
     else:
         impl = get_last_loc_torch
