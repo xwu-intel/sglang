@@ -1049,6 +1049,7 @@ class ModelRunner:
         else:
             self.attn_backend = self._get_attention_backend()
 
+
     # TODO unify with 6338
     def _get_attention_backend(self):
         if self.server_args.attention_backend == "flashinfer":
@@ -1095,7 +1096,7 @@ class ModelRunner:
         elif self.server_args.attention_backend == "hpu_attn_backend":
             from sglang.srt.layers.attention.hpu_attn_backend import HPUAttnBackend
 
-            self.attn_backend = HPUAttnBackend(self)
+            return HPUAttnBackend(self)
         elif self.server_args.attention_backend == "flashmla":
             from sglang.srt.layers.attention.flashmla_backend import FlashMLABackend
 
