@@ -1557,6 +1557,9 @@ class Scheduler(
         if self.is_generation:
             if self.spec_algorithm.is_none():
                 model_worker_batch = batch.get_model_worker_batch()
+
+                # print("***", model_worker_batch.hpu_metadata)
+
                 if self.pp_group.is_last_rank:
                     logits_output, next_token_ids, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_generation(model_worker_batch)

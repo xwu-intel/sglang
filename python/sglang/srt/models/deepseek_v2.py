@@ -2050,7 +2050,7 @@ class DeepseekV2ForCausalLM(nn.Module):
 
         count = 0
         for name, loaded_weight in weights:
-            print("Loading weight for", count, name)
+            # print("Loading weight for", count, name)
             count = count + 1
             if count > 100:
                 break

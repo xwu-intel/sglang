@@ -80,12 +80,15 @@ HPUForwardBatch = namedtuple(
         "attn_backend",
         "token_to_kv_pool",
         "use_contiguous_pa",
+        "extend_prefix_lens_cpu",
         "input_embeds",
         "extend_return_logprob",
         "padded_static_len",
         "capture_hidden_mode",
+        "can_run_tbo",
+
     ],
-    defaults=[None, False, -1, CaptureHiddenMode.NULL],
+    defaults=[None, False, -1, CaptureHiddenMode.NULL, False],
 )
 
 
@@ -122,6 +125,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_groups = None
         block_usage = None
         use_contiguous_pa = None
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
     else:
         padded_batch_size = get_decode_batch_bucket(batch_size)
         padding_len = padded_batch_size - batch_size
@@ -146,6 +150,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         block_groups = forward_batch.hpu_metadata.block_groups.to("hpu")
         block_usage = forward_batch.hpu_metadata.block_usage.to("hpu")
         use_contiguous_pa = forward_batch.hpu_metadata.use_contiguous_pa
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
 
     return HPUForwardBatch(
         forward_mode=forward_batch.forward_mode,
@@ -166,6 +171,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
         attn_backend=forward_batch.attn_backend,
         token_to_kv_pool=forward_batch.token_to_kv_pool,
         use_contiguous_pa=use_contiguous_pa,
+        extend_prefix_lens_cpu=extend_prefix_lens_cpu
     )
 
 
@@ -295,6 +301,9 @@ class HPUGraphRunner:
         return True
 
     def capture(self):
+
+        print("HPUGraphRunner capture")
+
         # prefill
         time_start = time.perf_counter()
         prefill_seq_len_buckets = get_prefill_all_seq_len_buckets()

@@ -39,7 +39,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton, is_hpu
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -105,6 +109,10 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
+        if _is_hpu:
+            # hpu will always use graph runner
+            return True
+
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -258,6 +266,8 @@ class ForwardBatch:
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
 
+    hpu_metadata: Optional[HPUBlockMetadata] = None
+
     @classmethod
     def init_new(
         cls,
@@ -304,6 +314,7 @@ class ForwardBatch:
                 len(batch.input_ids), dtype=torch.int32
             ).to(device, non_blocking=True),
             tbo_split_seq_index=batch.tbo_split_seq_index,
+            hpu_metadata=batch.hpu_metadata,
         )
 
         # For DP attention
