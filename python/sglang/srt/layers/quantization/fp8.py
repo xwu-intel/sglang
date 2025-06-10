@@ -509,10 +509,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
         if _is_hpu and self.quant_config.activation_scheme == "static":
-            print("*** Fp8LinearMethod apply x", x)
-            print("layer.input_scale", layer.input_scale, "1.0/layer.input_scale", 1.0/layer.input_scale)
+            # print("*** Fp8LinearMethod apply x", x)
+            # print("layer.input_scale", layer.input_scale, "1.0/layer.input_scale", 1.0/layer.input_scale)
             x_fp8 = torch.ops.hpu.cast_to_fp8_v2(x, 1.0/layer.input_scale, False, False, torch.float8_e4m3fn)[0]
-            print("*** Fp8LinearMethod x_fp8", x_fp8)
+            # print("*** Fp8LinearMethod x_fp8", x_fp8)
 
             return torch.ops.hpu.fp8_gemm_v2(
                 A=x_fp8,

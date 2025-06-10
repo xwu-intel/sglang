@@ -1798,14 +1798,11 @@ class DeepseekV2ForCausalLM(nn.Module):
             # Fix deepseek v3 blockwise bmm by using deep_gemm
             use_deep_gemm_bmm = False
             model_dtype = torch.get_default_dtype()
-            print("*********", self.quant_config.weight_block_size, flush=True)
 
             if w.dtype in (
                 torch.float8_e4m3fn,
                 torch.float8_e4m3fnuz,
             ):
-                print("*********", self.quant_config.weight_block_size, flush=True)
-
                 if (
                     hasattr(self.quant_config, "weight_block_size")
                     and self.quant_config.weight_block_size is not None
