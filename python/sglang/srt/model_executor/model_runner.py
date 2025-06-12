@@ -1244,6 +1244,7 @@ class ModelRunner:
             and self.cuda_graph_runner
             and self.cuda_graph_runner.can_run(forward_batch)
         )
+        print(f">>>>> [_forward_raw] forward_batch.forward_mode = {forward_batch.forward_mode}, forward_batch.forward_mode.is_cuda_graph() = {forward_batch.forward_mode.is_cuda_graph()}, self.cuda_graph_runner is not None = {self.cuda_graph_runner is not None}, self.cuda_graph_runner.can_run(forward_batch) = {self.cuda_graph_runner.can_run(forward_batch)}, can_run_cuda_graph = {can_run_cuda_graph}", flush=True)
         if can_run_cuda_graph:
             ret = self.cuda_graph_runner.replay(
                 forward_batch,

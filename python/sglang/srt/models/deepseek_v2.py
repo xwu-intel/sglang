@@ -587,6 +587,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        print(f">>>>>> [DeepseekV2AttentionMLA] self.layer_id = {self.layer_id}, self.hidden_size = {self.hidden_size}, self.qk_nope_head_dim = {self.qk_nope_head_dim}, self.qk_rope_head_dim = {self.qk_rope_head_dim}, self.qk_head_dim = {self.qk_head_dim}, self.v_head_dim = {self.v_head_dim}, self.q_lora_rank = {self.q_lora_rank}, self.kv_lora_rank = {self.kv_lora_rank}", flush=True)
         attn_tp_rank = get_attention_tp_rank()
         attn_tp_size = get_attention_tp_size()
 
@@ -800,6 +801,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        print(f">>>>>> [DeepseekV2AttentionMLA.forward] positions.shape = {positions.shape}, hidden_states.shape = {hidden_states.shape}, forward_batch.forward_mode = {forward_batch.forward_mode}", flush=True)
         s = self.forward_prepare(
             positions=positions,
             hidden_states=hidden_states,
@@ -868,6 +870,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        print(f">>>>>> [forward_normal_prepare] positions.shape = {positions.shape}, hidden_states.shape = {hidden_states.shape}", flush=True)
         if self.q_lora_rank is not None:
             q, latent_cache = self.fused_qkv_a_proj_with_mqa(hidden_states)[0].split(
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
@@ -906,6 +909,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         return q, k, v, forward_batch
 
     def forward_normal_core(self, q, k, v, forward_batch):
+        print(f">>>>>> [forward_normal_core] q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}", flush=True)
         attn_output = self.attn_mha(q, k, v, forward_batch, save_kv_cache=False)
         attn_output = attn_output.reshape(-1, self.num_local_heads * self.v_head_dim)
         output, _ = self.o_proj(attn_output)
@@ -918,6 +922,7 @@ class DeepseekV2AttentionMLA(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
+        print(f">>>>>> [forward_absorb_prepare] positions.shape = {positions.shape}, hidden_states.shape = {hidden_states.shape}", flush=True)
         from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
 
         if self.q_lora_rank is not None:
@@ -925,6 +930,7 @@ class DeepseekV2AttentionMLA(nn.Module):
                 [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
+            print(f">>>>>> [forward_absorb_prepare] 1. q.shape = {q.shape}, k_nope.shape = {k_nope.shape}", flush=True)
 
             # overlap qk norm
             if self.alt_stream is not None and get_is_capture_mode():
@@ -940,6 +946,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
             k_nope = k_nope.unsqueeze(1)
             q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+            print(f">>>>>> [forward_absorb_prepare] 2. q.shape = {q.shape}, k_nope.shape = {k_nope.shape}", flush=True)
         else:
             q = self.q_proj(hidden_states)[0].view(
                 -1, self.num_local_heads, self.qk_head_dim
@@ -950,6 +957,7 @@ class DeepseekV2AttentionMLA(nn.Module):
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        print(f">>>>>> [forward_absorb_prepare] 3. q_nope.shape = {q_nope.shape}, q_pe.shape = {q_pe.shape}, k_pe.shape = {k_pe.shape}", flush=True)
 
         if self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
@@ -988,9 +996,11 @@ class DeepseekV2AttentionMLA(nn.Module):
                 )
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
+        print(f">>>>>> [forward_absorb_prepare] 4. q_nope_out.shape = {q_nope_out.shape}", flush=True)
 
         q_nope_out = q_nope_out.transpose(0, 1)
         q_pe, k_pe = self.rotary_emb(positions, q_pe, k_pe)
+        print(f">>>>>> [forward_absorb_prepare] 5. q_pe.shape = {q_pe.shape}, k_pe.shape = {k_pe.shape}, q_nope_out.shape = {q_nope_out.shape}", flush=True)
 
         return q_pe, k_pe, q_nope_out, k_nope, forward_batch, zero_allocator
 
@@ -1002,8 +1012,10 @@ class DeepseekV2AttentionMLA(nn.Module):
                 q_nope_out, k_nope, k_nope, forward_batch, q_rope=q_pe, k_rope=k_pe
             )
         else:
+            print(f">>>>>>> [forward_absorb_core] q_pe.shape = {q_pe.shape}, k_pe.shape = {k_pe.shape}, q_nope_out.shape = {q_nope_out.shape}, k_nope.shape = {k_nope.shape}", flush=True)
             q = torch.cat([q_nope_out, q_pe], dim=-1)
             k = torch.cat([k_nope, k_pe], dim=-1)
+            print(f">>>>>>> [forward_absorb_core] q.shape = {q.shape}, k.shape = {k.shape}, k_nope.shape = {k_nope.shape}", flush=True)
             attn_output = self.attn_mqa(q, k, k_nope, forward_batch)
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 

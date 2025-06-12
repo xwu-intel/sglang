@@ -67,7 +67,7 @@ class HPUAttnBackend(AttentionBackend):
         query = q.view(1, -1, layer.tp_q_head_num, layer.qk_head_dim)
         key = k.view(1, -1, layer.tp_k_head_num, layer.qk_head_dim)
         value = v.view(1, -1, layer.tp_v_head_num, layer.v_head_dim)
-
+        print(f">>>>>>> [forward_extend] q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}, layer.tp_q_head_num = {layer.tp_q_head_num}, layer.qk_head_dim = {layer.qk_head_dim}, layer.tp_k_head_num = {layer.tp_k_head_num}, layer.tp_v_head_num = {layer.tp_v_head_num}, layer.v_head_dim = {layer.v_head_dim}", flush=True)
         output = ops.prompt_attention(
             # impl="fsdpa",
             query=query,
@@ -82,6 +82,7 @@ class HPUAttnBackend(AttentionBackend):
             matmul_av_op=self.matmul_av,
             fsdpa_op=self.fused_scaled_dot_product_attention,
         )
+        print(f">>>>>>> [forward_extend] query.shape = {query.shape}, key.shape = {key.shape}, value.shape = {value.shape}, output.shape = {output.shape}", flush=True)
         output = output.reshape(v.shape)
 
         return output
@@ -95,6 +96,7 @@ class HPUAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        print(f">>>>>>> [forward_decode] q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}", flush=True)
         # During torch.compile, there is a bug in rotary_emb that causes the
         # output value to have a 3D tensor shape. This reshapes the output correctly.
 
@@ -106,17 +108,20 @@ class HPUAttnBackend(AttentionBackend):
         # Get key and value caches
         key_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         value_cache = forward_batch.token_to_kv_pool.get_value_buffer(layer.layer_id)
+        print(f">>>>>>> [forward_decode] just from cache, key_cache.shape = {key_cache.shape}, value_cache.shape = {value_cache.shape}", flush=True)
 
-        query = q.view(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+        # query = q.view(-1, 1, layer.tp_q_head_num * layer.qk_head_dim)
+        query = q
         key_cache = key_cache.view(
             -1, forward_batch.page_size, layer.tp_k_head_num, layer.qk_head_dim
         )
         value_cache = value_cache.view(
             -1, forward_batch.page_size, layer.tp_v_head_num, layer.v_head_dim
         )
+        print(f">>>>>>> [forward_decode] forward_batch.page_size = {forward_batch.page_size}, layer.tp_q_head_num = {layer.tp_q_head_num}, layer.tp_k_head_num = {layer.tp_k_head_num}, layer.qk_head_dim = {layer.qk_head_dim}, layer.tp_v_head_num = {layer.tp_v_head_num}, layer.v_head_dim = {layer.v_head_dim}", flush=True)
 
+        print(f">>>>>> [forward_decode] forward_batch.use_contiguous_pa = {forward_batch.use_contiguous_pa}")
         if forward_batch.use_contiguous_pa:
-
             def fetch_key_cache(cache, blocks):
                 return cache[: blocks.size(0)]
 
@@ -131,6 +136,7 @@ class HPUAttnBackend(AttentionBackend):
             def fetch_value_cache(cache, blocks):
                 return cache.index_select(0, blocks)
 
+        print(f">>>>>>> [forward_decode] query.shape = {query.shape}, key_cache.shape = {key_cache.shape}, value_cache.shape = {value_cache.shape}, block_bias.shape = {forward_batch.attn_bias.shape}", flush=True)
         # Run paged attention decode
         output = ops.flat_pa(
             query=query,

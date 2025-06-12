@@ -151,9 +151,11 @@ from sglang.srt.utils import (
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
+    is_hpu,
 )
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
+_is_hpu = is_hpu()
 logger = logging.getLogger(__name__)
 
 # Test retract decode for debugging purposes
@@ -2224,6 +2226,8 @@ class Scheduler(
             "CPU": torch.profiler.ProfilerActivity.CPU,
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
+        if _is_hpu:
+            activity_map["HPU"] = torch.profiler.ProfilerActivity.HPU
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]

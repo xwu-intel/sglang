@@ -89,6 +89,8 @@ class RadixAttention(nn.Module):
         save_kv_cache: bool = True,
         **kwargs,
     ):
+        print(f">>>>>> [RadixAttention.forward] kwargs = {kwargs}, k is not None = {k is not None}, v is not None = {v is not None}, forward_batch.forward_mode = {forward_batch.forward_mode}", flush=True)
+        print(f">>>>>> [RadixAttention.forward] before, q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}", flush=True)
         if k is not None:
             # For cross-layer sharing, kv can be None
             assert v is not None
@@ -97,7 +99,7 @@ class RadixAttention(nn.Module):
                 v = v.view(-1, self.tp_v_head_num, self.v_head_dim)
             else:
                 k = k.view(-1, self.tp_k_head_num, self.v_head_dim)
-
+        print(f">>>>>> [RadixAttention.forward] after , q.shape = {q.shape}, k.shape = {k.shape}, v.shape = {v.shape}", flush=True)
         return forward_batch.attn_backend.forward(
             q,
             k,

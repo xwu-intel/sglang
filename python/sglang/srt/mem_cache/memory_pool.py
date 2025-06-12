@@ -522,6 +522,7 @@ class MLATokenToKVPool(KVCache):
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
     ):
+        print(f">>>>> [MLATokenToKVPool] size = {size}, page_size = {page_size}, kv_lora_rank = {kv_lora_rank}, qk_rope_head_dim = {qk_rope_head_dim}, layer_num = {layer_num}, start_layer = {start_layer}, end_layer = {end_layer}", flush=True)
         super().__init__(
             size,
             page_size,

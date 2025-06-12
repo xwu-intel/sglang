@@ -173,6 +173,7 @@ def create_hpu_forward_batch(forward_batch: ForwardBatch, model_runner: ModelRun
 def create_hpu_dummy_batch_prefill(
     seq_len, dtype, page_size, max_running_requests, attn_backend, token_to_kv_pool
 ):
+    print(f">>>>>> [create_hpu_dummy_batch_prefill] seq_len = {seq_len}, dtype = {dtype}, page_size = {page_size}, max_running_requests = {max_running_requests}", flush=True)
     return HPUForwardBatch(
         forward_mode=ForwardMode.EXTEND,
         batch_size=1,
@@ -202,6 +203,7 @@ def create_hpu_dummy_batch_prefill(
 def create_hpu_dummy_batch_decode(
     batch_size, block_num, dtype, page_size, attn_backend, token_to_kv_pool
 ):
+    print(f">>>>>> [create_hpu_dummy_batch_decode] batch_size = {batch_size}, block_num = {block_num}, dtype = {dtype}, page_size = {page_size}", flush=True)
     return HPUForwardBatch(
         forward_mode=ForwardMode.DECODE,
         batch_size=batch_size,
@@ -269,7 +271,7 @@ class HPUGraphRunner:
                 HPUAdapter(self.model_runner.model, self.model_runner.dtype),
                 disable_tensor_cache=True,
             )
-            if htorch.utils.internal.is_lazy() and False
+            if htorch.utils.internal.is_lazy()
             else HPUAdapter(self.model_runner.model, self.model_runner.dtype)
         )
         # Capture
@@ -300,6 +302,7 @@ class HPUGraphRunner:
         # prefill
         time_start = time.perf_counter()
         prefill_seq_len_buckets = get_prefill_all_seq_len_buckets()
+        print(f">>>>>> [capture] prefill seq len buckets = {prefill_seq_len_buckets}", flush=True)
         for seq_len in prefill_seq_len_buckets:
             self.capture_prefill(seq_len)
         time_end = time.perf_counter()
@@ -308,6 +311,7 @@ class HPUGraphRunner:
         # decode
         time_start = time.perf_counter()
         all_buckets = get_decode_all_buckets()
+        print(f">>>>>> [capture] decode all buckets = {all_buckets}", flush=True)
         for batch_size, seq_len in all_buckets:
             self.capture_decode(batch_size, seq_len)
         time_end = time.perf_counter()

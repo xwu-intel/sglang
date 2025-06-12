@@ -39,7 +39,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton
+from sglang.srt.utils import flatten_nested_list, get_compiler_backend, support_triton, is_hpu
+
+_is_hpu = is_hpu()
+if _is_hpu:
+    from sglang.srt.hpu_utils import HPUBlockMetadata
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -105,6 +109,9 @@ class ForwardMode(IntEnum):
         )
 
     def is_cuda_graph(self):
+        if _is_hpu:
+            # hpu will always use graph runner
+            return True
         return (
             self == ForwardMode.DECODE
             or self == ForwardMode.TARGET_VERIFY
@@ -254,6 +261,8 @@ class ForwardBatch:
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
+    hpu_metadata: Optional[HPUBlockMetadata] = None
+
     tbo_split_seq_index: Optional[int] = None
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
     tbo_children: Optional[List["ForwardBatch"]] = None
@@ -374,6 +383,9 @@ class ForwardBatch:
         # Init lora information
         if model_runner.server_args.lora_paths is not None:
             model_runner.lora_manager.prepare_lora_batch(ret)
+
+        if model_runner.server_args.attention_backend == "hpu_attn_backend":
+            ret.hpu_metadata = batch.hpu_metadata
 
         TboForwardBatchPreparer.prepare(ret)
 
@@ -709,7 +721,7 @@ def compute_position_torch(
     return positions.to(torch.int64), extend_start_loc
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_hpu)
 def clamp_position(seq_lens):
     return torch.clamp((seq_lens - 1), min=0).to(torch.int64)
 
